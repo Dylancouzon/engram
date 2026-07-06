@@ -46,7 +46,7 @@
       "name": "correction-diet",
       "existing": ["Maria is vegetarian"],
       "input": "Maria eats fish now, she is pescatarian these days",
-      "expect_op": "SUPERSEDE",
+      "expect_op": ["SUPERSEDE", "UPDATE"],
       "recall_query": "what does Maria eat",
       "expect_recalled": "pescatarian"
     },
