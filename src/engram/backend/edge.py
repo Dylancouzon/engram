@@ -1,0 +1,216 @@
+"""EdgeBackend: the Qdrant Edge shard behind engram.
+
+Edge runs in-process ("SQLite, but for vector search") and is treated as a
+rebuildable index: the journal owns durability, this class owns retrieval.
+flush() here is the commit point the journal's high-water mark tracks.
+
+Single-writer discipline is the caller's job (MemoryStore holds the app
+lockfile and serializes writes); Edge itself provides no locking in the
+0.7.2 Python surface.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from qdrant_edge import (
+    Distance,
+    EdgeConfig,
+    EdgeShard,
+    EdgeSparseVectorParams,
+    EdgeVectorParams,
+    FieldCondition,
+    Filter,
+    Fusion,
+    MatchAny,
+    MatchValue,
+    Modifier,
+    PayloadSchemaType,
+    Point,
+    Prefetch,
+    Query,
+    QueryRequest,
+    RangeFloat,
+    ScrollRequest,
+    SparseVector,
+    UpdateOperation,
+)
+
+from engram.embed import Embedded
+from engram.models import Memory, now_ts
+
+DENSE = "dense"
+SPARSE = "sparse"
+
+_KEYWORD_INDEXES = ("type", "scope", "tags")
+_FLOAT_INDEXES = ("created_at", "valid_from", "valid_to", "importance")
+
+
+@dataclass
+class Hit:
+    id: str
+    score: float
+    payload: dict[str, Any]
+
+    def memory(self) -> Memory:
+        return Memory.from_payload(self.id, self.payload)
+
+
+def build_filter(
+    scope: str | None = None,
+    type: str | None = None,
+    tags: list[str] | None = None,
+    valid_at: float | None = None,
+) -> Filter | None:
+    """Payload pre-filter applied during HNSW traversal. `valid_at` selects
+    memories valid at that instant (pass now for current, a past ts for
+    as-of queries); None skips validity filtering entirely."""
+    must: list[Any] = []
+    if scope:
+        must.append(FieldCondition(key="scope", match=MatchValue(scope)))
+    if type:
+        must.append(FieldCondition(key="type", match=MatchValue(type)))
+    if tags:
+        must.append(FieldCondition(key="tags", match=MatchAny(any=tags)))
+    if valid_at is not None:
+        must.append(FieldCondition(key="valid_from", range=RangeFloat(lte=valid_at)))
+        must.append(FieldCondition(key="valid_to", range=RangeFloat(gt=valid_at)))
+    return Filter(must=must) if must else None
+
+
+class EdgeBackend:
+    def __init__(self, shard_dir: Path, dense_dim: int):
+        self._dir = shard_dir
+        if shard_dir.exists() and any(shard_dir.iterdir()):
+            self._shard = EdgeShard.load(str(shard_dir))
+        else:
+            shard_dir.mkdir(parents=True, exist_ok=True)
+            self._shard = EdgeShard.create(
+                str(shard_dir),
+                EdgeConfig(
+                    vectors={DENSE: EdgeVectorParams(size=dense_dim, distance=Distance.Cosine)},
+                    sparse_vectors={SPARSE: EdgeSparseVectorParams(modifier=Modifier.Idf)},
+                ),
+            )
+            for field in _KEYWORD_INDEXES:
+                self._shard.update(
+                    UpdateOperation.create_field_index(field, PayloadSchemaType.Keyword)
+                )
+            for field in _FLOAT_INDEXES:
+                self._shard.update(
+                    UpdateOperation.create_field_index(field, PayloadSchemaType.Float)
+                )
+
+    # -- writes (caller serializes; journal acks first) ---------------------
+
+    def upsert(self, memory: Memory, emb: Embedded) -> None:
+        self._shard.update(
+            UpdateOperation.upsert_points(
+                [
+                    Point(
+                        id=memory.id,
+                        vector={
+                            DENSE: emb.dense,
+                            SPARSE: SparseVector(
+                                indices=emb.sparse_indices, values=emb.sparse_values
+                            ),
+                        },
+                        payload=memory.to_payload(),
+                    )
+                ]
+            )
+        )
+
+    def set_payload(self, memory_id: str, partial: dict[str, Any]) -> None:
+        """Metadata-only change (soft-invalidate, reinforce) — no re-embed."""
+        self._shard.update(UpdateOperation.set_payload([memory_id], partial))
+
+    def delete(self, memory_ids: list[str]) -> None:
+        self._shard.update(UpdateOperation.delete_points(list(memory_ids)))
+
+    def flush(self) -> None:
+        """The Edge commit point. The journal high-water mark advances only
+        after this returns."""
+        self._shard.flush()
+
+    def optimize(self) -> bool:
+        return self._shard.optimize()
+
+    def close(self) -> None:
+        self._shard.close()
+
+    # -- reads ---------------------------------------------------------------
+
+    def query_hybrid(
+        self,
+        emb: Embedded,
+        k: int,
+        flt: Filter | None = None,
+        prefetch_limit: int = 40,
+    ) -> list[Hit]:
+        """Dense + sparse prefetch branches fused with DBSF; filters applied
+        inside each branch (true pre-filter)."""
+        sparse_query = SparseVector(indices=emb.sparse_indices, values=emb.sparse_values)
+        prefetches = [
+            Prefetch(query=Query.Nearest(emb.dense, using=DENSE), filter=flt,
+                     limit=prefetch_limit),
+        ]
+        if emb.sparse_indices:
+            prefetches.append(
+                Prefetch(query=Query.Nearest(sparse_query, using=SPARSE), filter=flt,
+                         limit=prefetch_limit)
+            )
+        results = self._shard.query(
+            QueryRequest(
+                prefetches=prefetches,
+                query=Fusion.Dbsf(),
+                limit=k,
+                with_payload=True,
+            )
+        )
+        return [Hit(id=str(p.id), score=p.score, payload=p.payload or {}) for p in results]
+
+    def query_dense(self, dense: list[float], k: int, flt: Filter | None = None) -> list[Hit]:
+        """Dense-only search returning raw cosine scores — used where the
+        score must be an interpretable similarity (conflict candidates)."""
+        results = self._shard.query(
+            QueryRequest(
+                query=Query.Nearest(dense, using=DENSE),
+                filter=flt,
+                limit=k,
+                with_payload=True,
+            )
+        )
+        return [Hit(id=str(p.id), score=p.score, payload=p.payload or {}) for p in results]
+
+    def retrieve(self, memory_ids: list[str]) -> list[Hit]:
+        # with_vector is required positionally in the 0.7.2 binding despite
+        # the stub marking it optional.
+        records = self._shard.retrieve(list(memory_ids), with_payload=True, with_vector=False)
+        return [Hit(id=str(r.id), score=0.0, payload=r.payload or {}) for r in records]
+
+    def scroll_all(self, flt: Filter | None = None) -> list[Hit]:
+        out: list[Hit] = []
+        offset = None
+        while True:
+            records, offset = self._shard.scroll(
+                ScrollRequest(offset=offset, limit=256, filter=flt, with_payload=True)
+            )
+            out.extend(Hit(id=str(r.id), score=0.0, payload=r.payload or {}) for r in records)
+            if offset is None or not records:
+                break
+        return out
+
+    def count(self) -> int:
+        return self._shard.info().points_count
+
+    @staticmethod
+    def currently_valid_filter(**kwargs: Any) -> Filter | None:
+        return build_filter(valid_at=now_ts(), **kwargs)
+
+    @staticmethod
+    def now() -> float:
+        return time.time()

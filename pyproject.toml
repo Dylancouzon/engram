@@ -1,0 +1,40 @@
+[project]
+name = "engram"
+version = "0.1.0"
+description = "A personal, local-first, long-term memory for AI assistants — built on Qdrant Edge, exposed over MCP."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "Qdrant", email = "info@qdrant.com" }]
+keywords = ["memory", "ai", "mcp", "vector-search", "local-first", "qdrant"]
+dependencies = [
+    "qdrant-edge-py>=0.7.2",
+    "fastembed>=0.8.0",
+    "click>=8.1",
+]
+
+[project.scripts]
+engram = "engram.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/engram"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
