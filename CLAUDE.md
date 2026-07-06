@@ -20,7 +20,10 @@ touching `backend/edge.py`; the .pyi stub lies about some defaults.
 
 ## Commands
 
-- `uv run pytest tests/ -q` — unit + M0 exit tests (fake embedder, no downloads)
+- `uv run pytest tests/ -q` — unit + exit tests (fake embedder, no downloads)
+- `uv run engram daemon` — the shard-owning daemon (local API on a 0600
+  Unix socket; `ENGRAM_SOCKET` overrides the path — AF_UNIX caps ~104 bytes)
+- `uv run engram mcp --client <name>` — MCP stdio server (thin daemon client)
 - `uv run python golden/harness.py -v` — write-model accuracy vs golden set
   (real models; needs Ollama for non-ADD ops)
 - `uv run engram --help` — the CLI (`ENGRAM_HOME` overrides `~/.engram`)
@@ -28,8 +31,12 @@ touching `backend/edge.py`; the .pyi stub lies about some defaults.
 
 ## Layout
 
-`src/engram/`: `store.py` (pipelines) · `journal.py` (source of truth) ·
-`backend/edge.py` (shard) · `embed.py` (nomic + miniCOIL via FastEmbed) ·
-`extract.py`/`resolve.py`/`llm.py` (local model) · `redact.py` (stage-0) ·
-`cli.py` · `models.py`/`config.py`. Tests inject `FakeEmbedder`/`FakeLLM`
-(`tests/conftest.py`) — model downloads never happen in CI.
+`src/engram/`: `store.py` (pipelines, write lock, buffered reinforce) ·
+`journal.py` (source of truth) · `backend/edge.py` (shard) · `embed.py`
+(nomic + miniCOIL via FastEmbed) · `extract.py`/`resolve.py`/`llm.py`
+(local model) · `redact.py` (stage-0) · `protocol.py` (versioned local API,
+line-JSON over Unix socket) · `daemon.py` (shard owner; client registry =
+clients.json, default-deny except cli) · `client.py` (thin client, daemon
+auto-spawn) · `mcp_server.py` (FastMCP stdio) · `cli.py` (daemon-first,
+library fallback) · `models.py`/`config.py`. Tests inject
+`FakeEmbedder`/`FakeLLM` (`tests/conftest.py`) — no model downloads in CI.

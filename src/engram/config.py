@@ -79,6 +79,22 @@ class Config:
     def lock_path(self) -> Path:
         return self.data_dir / "writer.lock"
 
+    # AF_UNIX paths are capped (~104 bytes on macOS); a deep ENGRAM_HOME
+    # needs a short override. Set via config.toml or ENGRAM_SOCKET.
+    socket_override: Path | None = None
+
+    @property
+    def socket_path(self) -> Path:
+        if env := os.environ.get("ENGRAM_SOCKET"):
+            return Path(env)
+        return self.socket_override or self.data_dir / "daemon.sock"
+
+    @property
+    def clients_path(self) -> Path:
+        """Registered clients + their scope allowlists (daemon state, not
+        user config): {"claude-code": {"scopes": ["*"]}}"""
+        return self.data_dir / "clients.json"
+
     def owner_namespace(self) -> uuid.UUID:
         """Stable per-owner UUID namespace, created on first use."""
         owner_file = self.data_dir / "owner"

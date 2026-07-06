@@ -11,6 +11,7 @@ dependencies = [
     "qdrant-edge-py>=0.7.2",
     "fastembed>=0.8.0",
     "click>=8.1",
+    "mcp>=1.28.1",
 ]
 
 [project.scripts]

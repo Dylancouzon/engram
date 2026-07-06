@@ -13,9 +13,9 @@ from it; you decide what stays, what syncs, and what gets forgotten. It runs
 fully offline: embedding, retrieval, and extraction all happen on your machine,
 with no cloud in the loop.
 
-> **Status: early.** The core write/recall/forget engine and CLI work today
-> (M0). The MCP server that plugs engram into Claude Code, Claude Desktop,
-> Cursor, and other assistants is the next milestone. APIs may change.
+> **Status: early.** The core engine, CLI, daemon, and MCP server work
+> today. Proactive recall triggers, memory imports (ChatGPT/Claude), and
+> multi-device sync are on the roadmap. APIs may change.
 
 ## How It Works
 
@@ -89,6 +89,30 @@ ollama pull qwen3:4b
 Embedding models (~600 MB) download on first use and are cached per machine,
 not inside your memory folder.
 
+## Plug It Into Your Assistants
+
+One memory across every surface. A long-lived daemon owns your memory
+folder; the CLI and MCP servers are thin clients of it. Each app must be
+granted access first (default-deny), and you control which scopes it sees:
+
+```bash
+engram clients allow claude-code --scopes '*'
+claude mcp add engram -- engram mcp --client claude-code
+```
+
+For Claude Desktop or Cursor, register a client name the same way and add
+to the app's MCP config:
+
+```json
+{"mcpServers": {"engram": {"command": "engram", "args": ["mcp", "--client", "cursor"]}}}
+```
+
+The assistant gets three tools: `remember`, `recall`, and `forget`. A
+correction made in one app supersedes the stale fact everywhere, because
+there is only one memory. Apps granted `--scopes work` never see
+`personal` memories: recall is silently confined to allowed scopes, and
+writes outside them are refused.
+
 ## Commands
 
 | Command | What it does |
@@ -99,15 +123,18 @@ not inside your memory folder.
 | `engram seed <files>` | Import memories from markdown (CLAUDE.md, notes) |
 | `engram export` / `import` | JSONL journal dump / replay |
 | `engram stats` / `rebuild` | Store health / re-index from the journal |
+| `engram daemon` | Run the daemon (auto-started by MCP servers) |
+| `engram clients allow/revoke/list` | Which apps may access which scopes |
+| `engram mcp --client <name>` | MCP server for one registered app |
 
 ## Roadmap
 
-- **M1:** daemon + MCP server (one memory across Claude Code, Desktop, Cursor,
-  and any MCP client), proactive recall triggers, import from ChatGPT/Claude
-  memory exports, review queue for ambiguous conflicts.
-- **M2:** background consolidation (dedup, episodic summaries, decay pruning),
-  snapshot backup and restore.
-- **M3:** opt-in encrypted sync for multi-device and shared (family/team)
+- **Next:** proactive recall triggers (session-start hooks), import from
+  ChatGPT/Claude memory exports and Obsidian, review queue for ambiguous
+  conflicts, retrieval polish (server-side decay, MMR diversification).
+- **Then:** background consolidation (dedup, episodic summaries, decay
+  pruning), snapshot backup and restore.
+- **Later:** opt-in encrypted sync for multi-device and shared (family/team)
   memory pools.
 
 ## License

@@ -60,17 +60,21 @@ class Hit:
 
 
 def build_filter(
-    scope: str | None = None,
+    scope: str | list[str] | None = None,
     type: str | None = None,
     tags: list[str] | None = None,
     valid_at: float | None = None,
 ) -> Filter | None:
-    """Payload pre-filter applied during HNSW traversal. `valid_at` selects
-    memories valid at that instant (pass now for current, a past ts for
-    as-of queries); None skips validity filtering entirely."""
+    """Payload pre-filter applied during HNSW traversal. `scope` may be a
+    single scope or an allowlist (any match). `valid_at` selects memories
+    valid at that instant (pass now for current, a past ts for as-of
+    queries); None skips validity filtering entirely."""
     must: list[Any] = []
     if scope:
-        must.append(FieldCondition(key="scope", match=MatchValue(scope)))
+        if isinstance(scope, str):
+            must.append(FieldCondition(key="scope", match=MatchValue(scope)))
+        else:
+            must.append(FieldCondition(key="scope", match=MatchAny(any=list(scope))))
     if type:
         must.append(FieldCondition(key="type", match=MatchValue(type)))
     if tags:

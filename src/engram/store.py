@@ -22,6 +22,8 @@ import json
 import math
 import os
 import re
+import threading
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
@@ -69,14 +71,26 @@ class MemoryStore:
         *,
         embedder: Embedder | None = None,
         llm: LocalLLM | None | str = "auto",
+        reinforce_mode: str = "sync",
     ):
-        """`embedder` and `llm` exist for injection (tests, future daemon);
+        """`embedder` and `llm` exist for injection (tests, the daemon);
         the defaults build the real FastEmbed models and local Ollama probe.
-        Pass llm=None to force verbatim/ADD-only mode."""
+        Pass llm=None to force verbatim/ADD-only mode.
+
+        reinforce_mode: "sync" applies access bumps during recall (fine for
+        short-lived CLI processes); "buffered" queues them so reads never
+        write — the daemon drains the queue on idle and close."""
         self.config = config or Config.load()
         cfg = self.config
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(cfg.data_dir, 0o700)  # the memory folder is private by default
+
+        # Edge provides no locking and SQLite is externally serialized: every
+        # mutation goes through this lock. Reads (query/scroll) stay lock-free.
+        self._write_lock = threading.RLock()
+        self._reinforce_mode = reinforce_mode
+        self._reinforce_queue: Counter[str] = Counter()
+        self._reinforce_queue_lock = threading.Lock()
 
         # "a", not "w": never truncate before the lock is ours.
         self._lock_file = open(cfg.lock_path, "a")  # noqa: SIM115 - held for store lifetime
@@ -148,27 +162,30 @@ class MemoryStore:
             # A provenance pointer can carry credentials too (URLs).
             source_ref = redact(source_ref, enabled=self.config.redaction_enabled).text
 
-        facts = extract(clean_text, self.llm, self.config.salience_floor)
-        # source_text is kept only when input and memory are one-to-one:
-        # with multiple extracted facts, each would carry the full input, and
-        # hard-forgetting one fact must not leave its content living on in a
-        # sibling's source_text.
-        source_text = clean_text if len(facts) == 1 else None
-        actions: list[WriteAction] = []
-        for fact in facts:
-            # Explicit caller intent overrides the extractor's guesses.
-            if type is not None:
-                fact.type = type
-            if importance is not None:
-                fact.importance = importance
-            if tags:
-                fact.tags = list(dict.fromkeys(fact.tags + [t.lower() for t in tags]))
+        # The whole write is one critical section: two concurrent remembers
+        # must not both judge against pre-write state and then both apply.
+        with self._write_lock:
+            facts = extract(clean_text, self.llm, self.config.salience_floor)
+            # source_text is kept only when input and memory are one-to-one:
+            # with multiple extracted facts, each would carry the full input,
+            # and hard-forgetting one fact must not leave its content living
+            # on in a sibling's source_text.
+            source_text = clean_text if len(facts) == 1 else None
+            actions: list[WriteAction] = []
+            for fact in facts:
+                # Explicit caller intent overrides the extractor's guesses.
+                if type is not None:
+                    fact.type = type
+                if importance is not None:
+                    fact.importance = importance
+                if tags:
+                    fact.tags = list(dict.fromkeys(fact.tags + [t.lower() for t in tags]))
 
-            verdict = self._resolve_conflict(fact, scope)
-            action = self._apply(fact, verdict, source_text, scope, surface, source_ref)
-            action.redaction_hits = scrubbed.hits
-            actions.append(action)
-        return actions
+                verdict = self._resolve_conflict(fact, scope)
+                action = self._apply(fact, verdict, source_text, scope, surface, source_ref)
+                action.redaction_hits = scrubbed.hits
+                actions.append(action)
+            return actions
 
     def _resolve_conflict(self, fact: ExtractedFact, scope: str) -> Verdict:
         # Candidates come from a dense-only search: unlike fused scores,
@@ -304,7 +321,7 @@ class MemoryStore:
         self,
         query: str,
         k: int | None = None,
-        scope: str | None = None,
+        scope: str | list[str] | None = None,
         type: MemoryType | None = None,
         tags: list[str] | None = None,
         as_of: float | None = None,
@@ -342,20 +359,37 @@ class MemoryStore:
         return top
 
     def _reinforce(self, memory_ids: list[str]) -> None:
+        if self._reinforce_mode == "buffered":
+            with self._reinforce_queue_lock:
+                self._reinforce_queue.update(memory_ids)
+        else:
+            with self._write_lock:
+                self._apply_reinforce(Counter(memory_ids))
+
+    def flush_reinforce(self) -> int:
+        """Drain queued access bumps (buffered mode). The daemon calls this
+        on idle and at shutdown, so reads themselves never write."""
+        with self._reinforce_queue_lock:
+            drained = self._reinforce_queue
+            self._reinforce_queue = Counter()
+        if drained:
+            with self._write_lock:
+                self._apply_reinforce(drained)
+        return sum(drained.values())
+
+    def _apply_reinforce(self, bumps: Counter[str]) -> None:
         """Access bumps are journaled (so rebuilds keep them) but not
-        flushed — they ride along with the next write's flush or close()."""
+        flushed — they ride along with the next write's flush or close().
+        Replay is idempotent (absolute counts), so a crash loses nothing."""
         now = now_ts()
-        for mid in memory_ids:
+        for mid, n in bumps.items():
             hit = self.backend.retrieve([mid])
             if not hit:
                 continue
-            count = int(hit[0].payload.get("access_count") or 0) + 1
+            count = int(hit[0].payload.get("access_count") or 0) + n
             partial = {"access_count": count, "last_accessed": now}
             seq = self.journal.append("reinforce", mid, partial)
             self.backend.set_payload(mid, partial)
-            # Applied but deliberately not flushed — bumps ride along with
-            # the next write's flush or close(). Replay is idempotent
-            # (absolute counts), so a crash loses nothing.
             self._applied_seq = max(self._applied_seq, seq)
 
     # -- forget ------------------------------------------------------------------
@@ -363,6 +397,10 @@ class MemoryStore:
     def forget(self, memory_id: str, mode: str = "soft") -> Memory | None:
         """soft: invalidate now (history preserved, excluded from recall).
         hard: purge from Edge and the journal, VACUUM, leave a tombstone."""
+        with self._write_lock:
+            return self._forget_locked(memory_id, mode)
+
+    def _forget_locked(self, memory_id: str, mode: str) -> Memory | None:
         found = self.backend.retrieve([memory_id])
         memory = found[0].memory() if found else None
 
@@ -420,6 +458,10 @@ class MemoryStore:
         wipe the shard, then replay every entry in order, re-embedding from
         raw text. Without the wipe, points absent from the journal (stale
         imports, tombstoned ids) would survive in the index."""
+        with self._write_lock:
+            return self._rebuild_locked(wipe)
+
+    def _rebuild_locked(self, wipe: bool) -> int:
         if wipe:
             import shutil
 
@@ -452,10 +494,12 @@ class MemoryStore:
 
     def close(self) -> None:
         try:
-            self.backend.flush()
-            self.journal.mark_flushed(self._applied_seq)
-            self.backend.close()
-            self.journal.close()
+            self.flush_reinforce()
+            with self._write_lock:
+                self.backend.flush()
+                self.journal.mark_flushed(self._applied_seq)
+                self.backend.close()
+                self.journal.close()
         finally:
             fcntl.flock(self._lock_file, fcntl.LOCK_UN)
             self._lock_file.close()

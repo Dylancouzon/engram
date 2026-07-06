@@ -69,7 +69,9 @@ class Journal:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         existed = path.exists()
-        self._conn = sqlite3.connect(path)
+        # Thread-affinity off: the journal is only ever touched under the
+        # store's write lock (daemon threads included).
+        self._conn = sqlite3.connect(path, check_same_thread=False)
         if not existed:
             os.chmod(path, 0o600)  # memories are private by default
         # WAL for concurrency-friendly reads; FULL sync so an acked append

@@ -1,8 +1,8 @@
-"""engram CLI — library-mode surface for M0.
+"""engram CLI.
 
-Every command opens the store as the sole writer (exclusive lockfile),
-does its work, and closes cleanly. The daemon takes over this seat in M1;
-the CLI then becomes a thin client.
+Daemon-first: when the daemon is running, every command is a thin client of
+it over the local API. Otherwise commands fall back to library mode (open
+the store directly as the sole writer), so engram works with zero setup.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from pathlib import Path
 
 import click
 
+from engram.client import Client, DaemonUnavailable
 from engram.config import Config
 from engram.models import VALID_FOREVER, Memory, MemoryType, Op
 from engram.store import MemoryStore, StoreLockedError, WriteRefusedError
@@ -28,11 +29,29 @@ _OP_STYLES = {
 }
 
 
+def _config(data_dir: str | None) -> Config:
+    return Config.load(Path(data_dir) if data_dir else None)
+
+
 def _open_store(data_dir: str | None) -> MemoryStore:
     try:
-        return MemoryStore(Config.load(Path(data_dir) if data_dir else None))
+        return MemoryStore(_config(data_dir))
     except StoreLockedError as e:
-        raise click.ClickException(str(e)) from e
+        raise click.ClickException(
+            f"{e} — if that's the daemon, this command talks to it automatically;"
+            " otherwise remove the stale lock"
+        ) from e
+
+
+def _open_surface(data_dir: str | None) -> Client | MemoryStore:
+    """Daemon when it's running, library mode when it's not."""
+    cfg = _config(data_dir)
+    client = Client(cfg, client_name="cli")
+    try:
+        client.connect(spawn=False)
+        return client
+    except DaemonUnavailable:
+        return _open_store(data_dir)
 
 
 def _fmt_ts(ts: float | None) -> str:
@@ -88,7 +107,7 @@ def remember(data_dir: str | None, text: str, mtype: str | None, tags: str | Non
     """Store something worth keeping. Conflicts with existing memories are
     resolved on write: corrections supersede, refinements update."""
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
-    with _open_store(data_dir) as store:
+    with _open_surface(data_dir) as store:
         try:
             actions = store.remember(
                 text,
@@ -133,7 +152,7 @@ def recall(data_dir: str | None, query: str, k: int | None, scope: str | None,
     """Surface the memories relevant to a query (hybrid search, decayed by
     recency, weighted by importance)."""
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
-    with _open_store(data_dir) as store:
+    with _open_surface(data_dir) as store:
         hits = store.recall(
             query, k=k, scope=scope,
             type=MemoryType(mtype) if mtype else None, tags=tag_list,
@@ -161,7 +180,7 @@ def recall(data_dir: str | None, query: str, k: int | None, scope: str | None,
 @click.pass_obj
 def forget(data_dir: str | None, target: str, hard: bool, yes: bool) -> None:
     """Forget a memory, by id (or id prefix) or by search query."""
-    with _open_store(data_dir) as store:
+    with _open_surface(data_dir) as store:
         memory = _resolve_target(store, target)
         if memory is None:
             raise click.ClickException(f"no memory matches {target!r}")
@@ -177,18 +196,20 @@ def forget(data_dir: str | None, target: str, hard: bool, yes: bool) -> None:
         click.echo("invalidated: no longer recalled (history preserved).")
 
 
-def _resolve_target(store: MemoryStore, target: str) -> Memory | None:
+def _resolve_target(store: Client | MemoryStore, target: str) -> Memory | None:
     if re.fullmatch(r"[0-9a-fA-F-]{4,36}", target):
         try:
             uuid.UUID(target)
+            if isinstance(store, Client):
+                return store.get(target)
             found = store.backend.retrieve([target])
-            if found:
-                return found[0].memory()
+            return found[0].memory() if found else None
         except ValueError:
-            for hit in store.backend.scroll_all():
-                if hit.id.startswith(target.lower()):
-                    return hit.memory()
-            return None
+            if isinstance(store, MemoryStore):  # prefix scan needs the shard
+                for hit in store.backend.scroll_all():
+                    if hit.id.startswith(target.lower()):
+                        return hit.memory()
+                return None
     hits = store.recall(target, k=1, reinforce=False)
     return hits[0].memory if hits else None
 
@@ -200,8 +221,13 @@ def _resolve_target(store: MemoryStore, target: str) -> Memory | None:
 def export(data_dir: str | None, output) -> None:
     """Dump the journal as JSONL — the engine-agnostic export. Rebuild your
     memory anywhere by replaying it (`engram import`)."""
-    with _open_store(data_dir) as store:
-        n = store.export_jsonl(output)
+    with _open_surface(data_dir) as store:
+        if isinstance(store, Client):
+            data = store.export_jsonl()
+            output.write(data)
+            n = data.count("\n")
+        else:
+            n = store.export_jsonl(output)
     click.echo(f"exported {n} journal entries.", err=True)
 
 
@@ -267,8 +293,10 @@ def _split_markdown(text: str) -> list[str]:
 @click.pass_obj
 def stats(data_dir: str | None) -> None:
     """Store health: counts, journal state, models."""
-    with _open_store(data_dir) as store:
+    with _open_surface(data_dir) as store:
         info = store.stats()
+        if isinstance(store, Client):
+            info["daemon"] = "running"
     for key, value in info.items():
         click.echo(f"{key:>16}: {value}")
 
@@ -281,6 +309,75 @@ def rebuild(data_dir: str | None) -> None:
     with _open_store(data_dir) as store:
         applied = store.rebuild()
     click.echo(f"rebuilt index from journal: {applied} operations replayed.")
+
+
+@main.command()
+@click.pass_obj
+def daemon(data_dir: str | None) -> None:
+    """Run the engram daemon: the single owner of your memory, serving the
+    local API every other surface (CLI, MCP, importers) talks to."""
+    from engram.daemon import run_daemon
+
+    cfg = _config(data_dir)
+    click.echo(f"engram daemon starting on {cfg.socket_path}")
+    try:
+        run_daemon(cfg)
+    except StoreLockedError as e:
+        raise click.ClickException(str(e)) from e
+
+
+@main.group()
+def clients() -> None:
+    """Which apps may read or write which scopes (default-deny)."""
+
+
+@clients.command("allow")
+@click.argument("name")
+@click.option("--scopes", default="*",
+              help="Comma-separated scope allowlist, or * for everything.")
+@click.pass_obj
+def clients_allow(data_dir: str | None, name: str, scopes: str) -> None:
+    """Register a client (e.g. claude-code, cursor) and grant it scopes."""
+    from engram.daemon import ClientRegistry
+
+    scope_list = [s.strip() for s in scopes.split(",") if s.strip()]
+    ClientRegistry(_config(data_dir)).allow(name, scope_list)
+    click.echo(f"{name}: allowed scopes {', '.join(scope_list)}")
+
+
+@clients.command("revoke")
+@click.argument("name")
+@click.pass_obj
+def clients_revoke(data_dir: str | None, name: str) -> None:
+    """Remove a client's access."""
+    from engram.daemon import ClientRegistry
+
+    if ClientRegistry(_config(data_dir)).revoke(name):
+        click.echo(f"{name}: revoked")
+    else:
+        raise click.ClickException(f"no registered client {name!r}")
+
+
+@clients.command("list")
+@click.pass_obj
+def clients_list(data_dir: str | None) -> None:
+    """List registered clients and their scopes."""
+    from engram.daemon import ClientRegistry
+
+    for name, entry in ClientRegistry(_config(data_dir)).list().items():
+        click.echo(f"{name:>16}: {', '.join(entry['scopes'])}")
+
+
+@main.command()
+@click.option("--client", "client_name", required=True,
+              help="Client name this MCP server represents (must be registered).")
+@click.pass_obj
+def mcp(data_dir: str | None, client_name: str) -> None:
+    """Run the MCP server (stdio) — plugs engram into Claude Code, Claude
+    Desktop, Cursor, or any MCP client. Starts the daemon if needed."""
+    from engram.mcp_server import run_mcp
+
+    run_mcp(_config(data_dir), client_name)
 
 
 if __name__ == "__main__":
