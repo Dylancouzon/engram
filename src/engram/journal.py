@@ -20,9 +20,10 @@ The Edge shard is a rebuildable index over this log.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
@@ -67,7 +68,10 @@ class JournalEntry:
 class Journal:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
+        existed = path.exists()
         self._conn = sqlite3.connect(path)
+        if not existed:
+            os.chmod(path, 0o600)  # memories are private by default
         # WAL for concurrency-friendly reads; FULL sync so an acked append
         # survives power loss, not just process death. Writes are human-scale.
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -120,11 +124,13 @@ class Journal:
         return int(row[0]) if row else 0
 
     def mark_flushed(self, seq: int) -> None:
-        """Record that Edge has durably flushed everything up to `seq`."""
+        """Record that Edge has durably flushed everything up to `seq`.
+        Monotonic by construction: the mark never moves backwards."""
         with self._conn:
             self._conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('flushed_seq', ?)"
-                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                " ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(excluded.value AS INTEGER),"
+                " CAST(value AS INTEGER))",
                 (str(seq),),
             )
 
@@ -180,8 +186,10 @@ class Journal:
             n += 1
         return n
 
-    def import_jsonl(self, fp: TextIO) -> int:
-        """Replay a JSONL export into this journal (restore/migration)."""
+    def import_jsonl(self, fp: TextIO, scrub: Callable[[str], str] | None = None) -> int:
+        """Replay a JSONL export into this journal (restore/migration).
+        `scrub` runs over text fields — imported files may not come from a
+        store that redacted on write."""
         n = 0
         with self._conn:
             for line in fp:
@@ -195,11 +203,16 @@ class Journal:
                         (row["memory_id"], time.time()),
                     )
                 else:
+                    payload = row.get("payload")
+                    if payload is not None and scrub is not None:
+                        for key in ("text", "source_text", "dropped_text", "source_ref"):
+                            if isinstance(payload.get(key), str):
+                                payload[key] = scrub(payload[key])
                     self._conn.execute(
                         "INSERT INTO journal (op, memory_id, payload, ts) VALUES (?, ?, ?, ?)",
                         (row["op"], row["memory_id"],
-                         json.dumps(row["payload"], ensure_ascii=False)
-                         if row.get("payload") is not None else None,
+                         json.dumps(payload, ensure_ascii=False)
+                         if payload is not None else None,
                          row.get("ts", time.time())),
                     )
                 n += 1

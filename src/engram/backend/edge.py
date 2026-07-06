@@ -103,6 +103,9 @@ class EdgeBackend:
                 self._shard.update(
                     UpdateOperation.create_field_index(field, PayloadSchemaType.Float)
                 )
+            # Commit the schema immediately: a crash before the first write
+            # must not leave a loadable shard missing its indexes.
+            self._shard.flush()
 
     # -- writes (caller serializes; journal acks first) ---------------------
 
@@ -122,6 +125,32 @@ class EdgeBackend:
                     )
                 ]
             )
+        )
+
+    def export_raw(self, exclude: set[str] | None = None) -> list[tuple[str, Any, dict]]:
+        """Every point with its stored vectors and payload, minus `exclude`.
+        Feeds the purge-rebuild: points move to a fresh shard verbatim,
+        no re-embedding."""
+        exclude = exclude or set()
+        out: list[tuple[str, Any, dict]] = []
+        offset = None
+        while True:
+            records, offset = self._shard.scroll(
+                ScrollRequest(offset=offset, limit=256, with_payload=True, with_vector=True)
+            )
+            out.extend(
+                (str(r.id), r.vector, r.payload or {})
+                for r in records
+                if str(r.id) not in exclude
+            )
+            if offset is None or not records:
+                break
+        return out
+
+    def upsert_raw(self, point_id: str, vector: Any, payload: dict[str, Any]) -> None:
+        """Re-insert a point exactly as exported (vectors already computed)."""
+        self._shard.update(
+            UpdateOperation.upsert_points([Point(id=point_id, vector=vector, payload=payload)])
         )
 
     def set_payload(self, memory_id: str, partial: dict[str, Any]) -> None:

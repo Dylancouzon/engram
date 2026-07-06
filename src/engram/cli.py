@@ -210,8 +210,12 @@ def export(data_dir: str | None, output) -> None:
 @click.pass_obj
 def import_(data_dir: str | None, source) -> None:
     """Replay a JSONL export into this store (restore / migration)."""
+    from engram.redact import redact
+
     with _open_store(data_dir) as store:
-        n = store.journal.import_jsonl(source)
+        # Imported files may not come from a store that redacted on write.
+        scrub = (lambda t: redact(t).text) if store.config.redaction_enabled else None
+        n = store.journal.import_jsonl(source, scrub=scrub)
         applied = store.rebuild()
     click.echo(f"imported {n} entries, rebuilt index with {applied} operations.")
 
@@ -274,11 +278,6 @@ def stats(data_dir: str | None) -> None:
 def rebuild(data_dir: str | None) -> None:
     """Re-index everything from the journal (after model changes or to
     verify the journal really is the source of truth)."""
-    import shutil
-
-    cfg = Config.load(Path(data_dir) if data_dir else None)
-    if cfg.shard_dir.exists():
-        shutil.rmtree(cfg.shard_dir)
     with _open_store(data_dir) as store:
         applied = store.rebuild()
     click.echo(f"rebuilt index from journal: {applied} operations replayed.")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -17,14 +18,18 @@ _THINK_TAGS = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 class LocalLLM:
+    PROBE_TTL = 60.0  # long-lived processes (the M1 daemon) re-probe
+
     def __init__(self, url: str, model: str, timeout: float = 60.0):
         self._url = url.rstrip("/")
         self._model = model
         self._timeout = timeout
         self._available: bool | None = None
+        self._probed_at = 0.0
 
     def available(self) -> bool:
-        if self._available is None:
+        now = time.monotonic()
+        if self._available is None or now - self._probed_at > self.PROBE_TTL:
             try:
                 with urllib.request.urlopen(self._url + "/api/tags", timeout=2.0) as resp:
                     tags = json.loads(resp.read())
@@ -32,6 +37,7 @@ class LocalLLM:
                 self._available = any(n.startswith(self._model.split(":")[0]) for n in names)
             except (urllib.error.URLError, TimeoutError, OSError, ValueError):
                 self._available = False
+            self._probed_at = now
         return self._available
 
     def generate_json(self, system: str, prompt: str) -> Any | None:

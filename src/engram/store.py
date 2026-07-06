@@ -20,8 +20,10 @@ import fcntl
 import hashlib
 import json
 import math
+import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import TracebackType
 from typing import TextIO
 
@@ -74,8 +76,10 @@ class MemoryStore:
         self.config = config or Config.load()
         cfg = self.config
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(cfg.data_dir, 0o700)  # the memory folder is private by default
 
-        self._lock_file = open(cfg.lock_path, "w")  # noqa: SIM115 - held for store lifetime
+        # "a", not "w": never truncate before the lock is ours.
+        self._lock_file = open(cfg.lock_path, "a")  # noqa: SIM115 - held for store lifetime
         try:
             fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as e:
@@ -84,19 +88,45 @@ class MemoryStore:
                 f"another engram process holds {cfg.lock_path}"
             ) from e
 
-        self._owner_ns = cfg.owner_namespace()
-        self.journal = Journal(cfg.journal_path)
-        self.backend = EdgeBackend(cfg.shard_dir, dense_dim=cfg.dense_dim)
-        self.embedder = embedder or Embedder(cfg.models_dir)
-        self.llm = (
-            LocalLLM(cfg.ollama_url, cfg.extraction_model) if llm == "auto" else llm
-        )
-        # Highest journal seq actually applied to Edge in this session. The
-        # high-water mark may only ever advance to this — never to last_seq
-        # blindly, or a write that crashed between journal-append and
-        # Edge-apply would be skipped by replay forever.
-        self._applied_seq = self.journal.flushed_seq
-        self._replay_pending()
+        try:
+            self._owner_ns = cfg.owner_namespace()
+            self.journal = Journal(cfg.journal_path)
+            self.embedder = embedder or Embedder(cfg.models_dir)
+            self.llm = (
+                LocalLLM(cfg.ollama_url, cfg.extraction_model) if llm == "auto" else llm
+            )
+            if self._purge_marker.exists():
+                # A hard-forget purge (or its recovery) was interrupted. The
+                # journal is already clean, so rebuild the index from it.
+                self._recover_interrupted_purge()
+            else:
+                self.backend = EdgeBackend(cfg.shard_dir, dense_dim=cfg.dense_dim)
+            # Highest journal seq actually applied to Edge in this session.
+            # The high-water mark may only ever advance to this — never to
+            # last_seq blindly, or a write that crashed between journal-append
+            # and Edge-apply would be skipped by replay forever.
+            self._applied_seq = self.journal.flushed_seq
+            self._replay_pending()
+        except BaseException:
+            fcntl.flock(self._lock_file, fcntl.LOCK_UN)
+            self._lock_file.close()
+            raise
+
+    @property
+    def _purge_marker(self) -> Path:
+        return self.config.data_dir / "purge.pending"
+
+    def _recover_interrupted_purge(self) -> None:
+        import shutil
+
+        shard_dir = self.config.shard_dir
+        stale = shard_dir.with_name(shard_dir.name + ".purging")
+        for path in (shard_dir, stale):
+            if path.exists():
+                shutil.rmtree(path)
+        self.backend = EdgeBackend(shard_dir, dense_dim=self.config.dense_dim)
+        self.rebuild(wipe=False)  # the shard was just wiped and recreated
+        self._purge_marker.unlink()
 
     # -- write ---------------------------------------------------------------
 
@@ -114,8 +144,16 @@ class MemoryStore:
         if scrubbed.refused:
             raise WriteRefusedError(scrubbed.refusal_reason or "refused by redaction")
         clean_text = scrubbed.text
+        if source_ref:
+            # A provenance pointer can carry credentials too (URLs).
+            source_ref = redact(source_ref, enabled=self.config.redaction_enabled).text
 
         facts = extract(clean_text, self.llm, self.config.salience_floor)
+        # source_text is kept only when input and memory are one-to-one:
+        # with multiple extracted facts, each would carry the full input, and
+        # hard-forgetting one fact must not leave its content living on in a
+        # sibling's source_text.
+        source_text = clean_text if len(facts) == 1 else None
         actions: list[WriteAction] = []
         for fact in facts:
             # Explicit caller intent overrides the extractor's guesses.
@@ -127,7 +165,7 @@ class MemoryStore:
                 fact.tags = list(dict.fromkeys(fact.tags + [t.lower() for t in tags]))
 
             verdict = self._resolve_conflict(fact, scope)
-            action = self._apply(fact, verdict, clean_text, scope, surface, source_ref)
+            action = self._apply(fact, verdict, source_text, scope, surface, source_ref)
             action.redaction_hits = scrubbed.hits
             actions.append(action)
         return actions
@@ -188,6 +226,18 @@ class MemoryStore:
         now = now_ts()
 
         if op is Op.NOOP and verdict.target is not None:
+            # Audit trail: a NOOP silently drops the incoming statement, so
+            # record what was dropped and why. Replay ignores these rows;
+            # hard-forgetting the target removes them too (same memory_id).
+            noop_seq = self.journal.append(
+                "noop",
+                verdict.target.id,
+                {"dropped_text": fact.text, "confidence": verdict.confidence},
+            )
+            # A noop has no Edge effect, so it is durable the moment it's in
+            # the journal: advance both marks past it immediately.
+            self._applied_seq = max(self._applied_seq, noop_seq)
+            self.journal.mark_flushed(noop_seq)
             self._reinforce([verdict.target.id])
             return WriteAction(op=Op.NOOP, memory=None, target=verdict.target,
                                confidence=verdict.confidence)
@@ -328,22 +378,54 @@ class MemoryStore:
             self.journal.mark_flushed(self._applied_seq)
             return memory
 
-        # hard: order matters — Edge first, then the journal purge; a crash
-        # in between leaves a journal whose replay no longer resurrects the
-        # point (tombstone written in the same transaction as the purge).
-        self.backend.delete([memory_id])
-        self.backend.flush()
+        # hard. Deleting the point from Edge is not enough: delete+flush
+        # leaves the content readable in the shard's WAL and payload pages
+        # (verified empirically). The only byte-level guarantee is a shard
+        # rebuild that never contained the memory. Order matters:
+        #   1. marker on          — a crash anywhere below leads to a
+        #                           rebuild-from-journal on next open
+        #   2. journal purge      — the source of truth forgets first
+        #                           (tombstone + DELETE + VACUUM)
+        #   3. shard purge-rebuild — surviving points move verbatim
+        #                           (vectors preserved, no re-embed)
+        self._purge_marker.touch()
         self.journal.hard_forget(memory_id)
+        self._purge_shard(exclude={memory_id})
+        self._purge_marker.unlink()
         return memory
+
+    def _purge_shard(self, exclude: set[str]) -> None:
+        import shutil
+
+        survivors = self.backend.export_raw(exclude=exclude)
+        self.backend.close()
+        shard_dir = self.config.shard_dir
+        trash = shard_dir.with_name(shard_dir.name + ".purging")
+        shard_dir.rename(trash)
+        self.backend = EdgeBackend(shard_dir, dense_dim=self.config.dense_dim)
+        for point_id, vector, payload in survivors:
+            self.backend.upsert_raw(point_id, vector, payload)
+        self._applied_seq = self.journal.last_seq
+        self.backend.flush()
+        self.journal.mark_flushed(self._applied_seq)
+        shutil.rmtree(trash)
 
     # -- maintenance ---------------------------------------------------------------
 
     def export_jsonl(self, fp: TextIO) -> int:
         return self.journal.export_jsonl(fp)
 
-    def rebuild(self) -> int:
-        """Rebuild the Edge index from the journal (restore/migration path):
-        replay every entry in order, re-embedding from raw text."""
+    def rebuild(self, wipe: bool = True) -> int:
+        """Rebuild the Edge index as a true projection of the journal:
+        wipe the shard, then replay every entry in order, re-embedding from
+        raw text. Without the wipe, points absent from the journal (stale
+        imports, tombstoned ids) would survive in the index."""
+        if wipe:
+            import shutil
+
+            self.backend.close()
+            shutil.rmtree(self.config.shard_dir)
+            self.backend = EdgeBackend(self.config.shard_dir, dense_dim=self.config.dense_dim)
         applied = 0
         tombstoned = self.journal.tombstones()
         for entry in self.journal.entries():

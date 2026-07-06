@@ -92,7 +92,8 @@ def judge(new_fact: str, candidates: list[Memory], llm: LocalLLM | None) -> Verd
 
     target: Memory | None = None
     idx = result.get("target")
-    if isinstance(idx, int) and 0 <= idx < len(candidates):
+    # bool is an int subclass: {"target": true} must not select index 1.
+    if isinstance(idx, int) and not isinstance(idx, bool) and 0 <= idx < len(candidates):
         target = candidates[idx]
     if op is not Op.ADD and target is None:
         # An op that needs a target but names none is not actionable.

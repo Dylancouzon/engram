@@ -58,9 +58,11 @@ running inside the process like SQLite.
 - **Secrets never land.** A deterministic scrubber runs before anything is
   extracted, embedded, or persisted. API keys and tokens are redacted;
   private keys refuse the whole write.
-- **Forgotten means gone.** `forget --hard` purges the memory from the index
-  and the journal (including a database VACUUM), leaving only a content-free
-  tombstone. The tests assert on raw database bytes.
+- **Forgotten means gone.** `forget --hard` purges the memory from the
+  journal (delete + VACUUM) and rebuilds the search index without it, because
+  a plain index delete leaves content readable in storage pages. Afterwards
+  the content exists in no file in your memory folder: the tests grep raw
+  bytes to prove it. Only a content-free tombstone remains.
 - **Built to outlive any app.** `engram export` dumps the write journal as
   JSONL: plain text, no vectors, no lock-in. Replaying it rebuilds your
   memory on any machine, any future version, or any other engine.
