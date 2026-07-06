@@ -172,9 +172,9 @@ def forget(data_dir: str | None, target: str, hard: bool, yes: bool) -> None:
             return
         store.forget(memory.id, mode=mode)
     if hard:
-        click.echo(click.style("purged — index, journal and future exports.", fg="red"))
+        click.echo(click.style("purged: index, journal, and future exports.", fg="red"))
     else:
-        click.echo("invalidated — no longer recalled (history preserved).")
+        click.echo("invalidated: no longer recalled (history preserved).")
 
 
 def _resolve_target(store: MemoryStore, target: str) -> Memory | None:

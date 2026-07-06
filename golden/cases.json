@@ -1,0 +1,202 @@
+{
+  "_comment": "Golden set for the M0 write model. Each case seeds `existing` memories, writes `input`, and grades the resulting op (+ optional recall probe). DRAFT — Dylan reviews/replaces with real cases (spec §10).",
+  "cases": [
+    {
+      "name": "correction-explicit",
+      "existing": ["Dylan lives in Paris"],
+      "input": "Correction: Dylan lives in Berlin now",
+      "expect_op": "SUPERSEDE",
+      "recall_query": "what city does Dylan live in",
+      "expect_recalled": "Berlin",
+      "expect_not_recalled": "Paris"
+    },
+    {
+      "name": "correction-implicit-move",
+      "existing": ["Dylan works at Datadog"],
+      "input": "Dylan started a new job at Qdrant as a DevRel engineer",
+      "expect_op": "SUPERSEDE",
+      "recall_query": "where does Dylan work",
+      "expect_recalled": "Qdrant"
+    },
+    {
+      "name": "correction-preference-flip",
+      "existing": ["Dylan prefers VS Code as his main editor"],
+      "input": "Dylan switched to Zed and uses it for everything now",
+      "expect_op": "SUPERSEDE",
+      "recall_query": "which editor does Dylan use",
+      "expect_recalled": "Zed"
+    },
+    {
+      "name": "correction-name-fix",
+      "existing": ["Dylan's manager is called Andre Zayarni"],
+      "input": "Actually the correct spelling is André Zayarni, with the accent",
+      "expect_op": ["SUPERSEDE", "UPDATE"],
+      "recall_query": "who is Dylan's manager",
+      "expect_recalled": "André"
+    },
+    {
+      "name": "correction-config-value",
+      "existing": ["The staging cluster runs Qdrant 1.12"],
+      "input": "Staging was upgraded to Qdrant 1.15 last night",
+      "expect_op": "SUPERSEDE",
+      "recall_query": "which Qdrant version is on staging",
+      "expect_recalled": "1.15"
+    },
+    {
+      "name": "correction-diet",
+      "existing": ["Maria is vegetarian"],
+      "input": "Maria eats fish now, she is pescatarian these days",
+      "expect_op": "SUPERSEDE",
+      "recall_query": "what does Maria eat",
+      "expect_recalled": "pescatarian"
+    },
+    {
+      "name": "correction-deadline-moved",
+      "existing": ["The launch is planned for March 3rd"],
+      "input": "The launch got pushed to March 17th",
+      "expect_op": "SUPERSEDE",
+      "recall_query": "when is the launch",
+      "expect_recalled": "March 17"
+    },
+    {
+      "name": "correction-tool-decision-reversed",
+      "existing": ["The team decided to use Postgres for the metadata store"],
+      "input": "We reversed the metadata store decision: it will be SQLite, not Postgres",
+      "expect_op": "SUPERSEDE",
+      "recall_query": "what database did we pick for metadata",
+      "expect_recalled": "SQLite"
+    },
+
+    {
+      "name": "update-adds-detail",
+      "existing": ["Dylan's cat is named Miso"],
+      "input": "Miso is a grey British Shorthair",
+      "expect_op": ["UPDATE", "ADD"],
+      "recall_query": "what breed is Dylan's cat",
+      "expect_recalled": "Shorthair"
+    },
+    {
+      "name": "update-refines-quantity",
+      "existing": ["Dylan runs a few times a week"],
+      "input": "Dylan runs exactly three times a week, tuesdays thursdays and sundays",
+      "expect_op": "UPDATE",
+      "recall_query": "how often does Dylan run",
+      "expect_recalled": "three"
+    },
+    {
+      "name": "update-adds-context",
+      "existing": ["The demo runs on a Jetson"],
+      "input": "The demo runs on a Jetson Orin Nano with 8GB of RAM",
+      "expect_op": "UPDATE",
+      "recall_query": "what hardware does the demo run on",
+      "expect_recalled": "8GB"
+    },
+    {
+      "name": "update-email-detail",
+      "existing": ["Sarah handles the newsletter"],
+      "input": "Sarah handles the newsletter, it goes out every second Tuesday",
+      "expect_op": "UPDATE",
+      "recall_query": "when does the newsletter go out",
+      "expect_recalled": "Tuesday"
+    },
+    {
+      "name": "update-version-pin-detail",
+      "existing": ["The project uses Python"],
+      "input": "The project is pinned to Python 3.12 because of the Edge wheel",
+      "expect_op": "UPDATE",
+      "recall_query": "which Python version does the project use",
+      "expect_recalled": "3.12"
+    },
+
+    {
+      "name": "noop-exact-duplicate",
+      "existing": ["Dylan's cat is named Miso"],
+      "input": "Dylan's cat is named Miso",
+      "expect_op": "NOOP"
+    },
+    {
+      "name": "noop-paraphrase",
+      "existing": ["Dylan is allergic to peanuts"],
+      "input": "Dylan has a peanut allergy",
+      "expect_op": "NOOP"
+    },
+    {
+      "name": "noop-weaker-version",
+      "existing": ["Dylan runs three times a week, tuesdays thursdays and sundays"],
+      "input": "Dylan goes running regularly",
+      "expect_op": "NOOP"
+    },
+    {
+      "name": "noop-restated-decision",
+      "existing": ["The team decided to use miniCOIL for sparse vectors"],
+      "input": "Reminder that we're going with miniCOIL on the sparse side",
+      "expect_op": "NOOP"
+    },
+
+    {
+      "name": "add-different-entity-same-attribute",
+      "existing": ["Dylan's cat is named Miso"],
+      "input": "Sarah's cat is named Mochi",
+      "expect_op": "ADD",
+      "recall_query": "what is Sarah's cat called",
+      "expect_recalled": "Mochi",
+      "expect_not_recalled_first": "Miso"
+    },
+    {
+      "name": "add-same-entity-different-attribute",
+      "existing": ["Dylan lives in Berlin"],
+      "input": "Dylan speaks French and English",
+      "expect_op": "ADD",
+      "recall_query": "which languages does Dylan speak",
+      "expect_recalled": "French"
+    },
+    {
+      "name": "add-sibling-fact-not-conflict",
+      "existing": ["The staging cluster runs Qdrant 1.15"],
+      "input": "The production cluster runs Qdrant 1.14",
+      "expect_op": "ADD",
+      "recall_query": "which version runs in production",
+      "expect_recalled": "1.14"
+    },
+    {
+      "name": "add-second-pet-not-supersede",
+      "existing": ["Dylan's cat is named Miso"],
+      "input": "Dylan adopted a second cat named Tofu",
+      "expect_op": "ADD",
+      "recall_query": "what are Dylan's cats called",
+      "expect_recalled": "Tofu"
+    },
+    {
+      "name": "add-preference-different-domain",
+      "existing": ["Dylan prefers uv over pip for Python projects"],
+      "input": "Dylan prefers pnpm over npm for JavaScript projects",
+      "expect_op": "ADD",
+      "recall_query": "what package manager does Dylan use for JavaScript",
+      "expect_recalled": "pnpm"
+    },
+    {
+      "name": "add-temporal-episode-vs-fact",
+      "existing": ["Dylan lives in Berlin"],
+      "input": "Dylan visited Paris last weekend for a conference",
+      "expect_op": "ADD",
+      "recall_query": "where does Dylan live",
+      "expect_recalled": "Berlin"
+    },
+    {
+      "name": "add-opinion-vs-fact",
+      "existing": ["The launch is planned for March 17th"],
+      "input": "Dylan thinks the March launch date is too aggressive",
+      "expect_op": "ADD",
+      "recall_query": "when is the launch",
+      "expect_recalled": "March 17"
+    },
+    {
+      "name": "add-negation-is-supersede-not-add",
+      "existing": ["Dylan takes oat milk in his coffee"],
+      "input": "Dylan stopped taking milk in his coffee entirely, he drinks it black now",
+      "expect_op": "SUPERSEDE",
+      "recall_query": "how does Dylan take his coffee",
+      "expect_recalled": "black"
+    }
+  ]
+}

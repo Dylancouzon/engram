@@ -48,11 +48,19 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
         return [ExtractedFact(text=text.strip(), verbatim=True)]
 
     result = llm.generate_json(_SYSTEM, text)
-    if result is None or not isinstance(result, dict):
+    # Small local models are loose about the envelope: accept the documented
+    # {"memories": [...]}, a bare list, or a single bare memory object.
+    if isinstance(result, dict) and "memories" in result:
+        items = result["memories"]
+    elif isinstance(result, dict) and result.get("text"):
+        items = [result]
+    elif isinstance(result, list):
+        items = result
+    else:
         return [ExtractedFact(text=text.strip(), verbatim=True)]
 
     facts: list[ExtractedFact] = []
-    for item in result.get("memories", []):
+    for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict) or not item.get("text"):
             continue
         try:

@@ -68,7 +68,11 @@ class Config:
 
     @property
     def models_dir(self) -> Path:
-        return self.data_dir / "models"
+        # Deliberately NOT inside data_dir: the memory folder stays small and
+        # portable; models are a per-machine tier, re-provisioned from the
+        # pinned names above (or re-downloaded on first use).
+        cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        return cache_root / "engram" / "models"
 
     @property
     def lock_path(self) -> Path:
