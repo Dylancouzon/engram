@@ -20,6 +20,7 @@ import fcntl
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import TextIO
@@ -33,6 +34,11 @@ from engram.llm import LocalLLM
 from engram.models import Memory, MemoryType, Op, RecallHit, new_memory_id, now_ts
 from engram.redact import redact
 from engram.resolve import Verdict, judge
+
+
+def _normalize(text: str) -> str:
+    """Case/punctuation/whitespace-insensitive form for verbatim-dedup."""
+    return re.sub(r"[\W_]+", " ", text.lower()).strip()
 
 
 class StoreLockedError(RuntimeError):
@@ -137,10 +143,27 @@ class MemoryStore:
             k=self.config.conflict_top_k,
             flt=build_filter(scope=scope, valid_at=now_ts()),
         )
-        candidates = [
-            h.memory() for h in hits if h.score >= self.config.conflict_min_similarity
+        scored = [
+            (h.memory(), h.score)
+            for h in hits
+            if h.score >= self.config.conflict_min_similarity
         ]
-        return judge(fact.text, candidates, self.llm)
+        candidates = [m for m, _ in scored]
+
+        # Deterministic dedup before the judge: an (almost) verbatim repeat
+        # is a NOOP regardless of what a small model thinks.
+        norm = _normalize(fact.text)
+        for m, score in scored:
+            if _normalize(m.text) == norm:
+                return Verdict(op=Op.NOOP, target=m, confidence=1.0,
+                               target_similarity=score)
+
+        verdict = judge(fact.text, candidates, self.llm)
+        if verdict.target is not None:
+            verdict.target_similarity = next(
+                (s for m, s in scored if m.id == verdict.target.id), 0.0
+            )
+        return verdict
 
     def _apply(
         self,
@@ -152,6 +175,15 @@ class MemoryStore:
         source_ref: str | None,
     ) -> WriteAction:
         confident = verdict.confidence >= self.config.judge_confidence
+        # A NOOP the judge is lukewarm on still stands when the retrieval
+        # similarity independently says "near-duplicate" — two weak signals
+        # agreeing. UPDATE/SUPERSEDE never get this shortcut: a wrongful
+        # merge or supersede is the unrecoverable direction.
+        if (
+            verdict.op is Op.NOOP
+            and verdict.target_similarity >= self.config.noop_similarity
+        ):
+            confident = True
         op = verdict.op if confident else Op.ADD
         now = now_ts()
 

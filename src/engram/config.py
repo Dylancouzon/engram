@@ -39,6 +39,7 @@ class Config:
     judge_confidence: float = 0.8  # auto-apply UPDATE/SUPERSEDE at or above this
     conflict_top_k: int = 5  # similar memories retrieved for the judge
     conflict_min_similarity: float = 0.6  # candidates below this aren't conflicts
+    noop_similarity: float = 0.9  # NOOP verdicts stand at any confidence above this
 
     # Retrieval
     recall_k: int = 8

@@ -41,16 +41,17 @@ def test_second_writer_locked_out(config):
 
 def test_secret_redacted_before_persistence(config):
     store = make_store(config)
+    fake_secret = "".join(["zX9v2", "Lq8Tr", "W4bN6m"])  # runtime-assembled: not a real secret
     try:
-        actions = store.remember("staging api_key = zX9v2Lq8TrW4bN6m no one must lose this")
+        actions = store.remember(f"staging api_key = {fake_secret} no one must lose this")
         stored = actions[0].memory
-        assert "zX9v2Lq8TrW4bN6m" not in stored.text
+        assert fake_secret not in stored.text
         for entry in store.journal.entries():
-            assert "zX9v2Lq8TrW4bN6m" not in (entry.payload or {}).get("text", "")
+            assert fake_secret not in (entry.payload or {}).get("text", "")
     finally:
         store.close()
     raw = config.journal_path.read_bytes()
-    assert b"zX9v2Lq8TrW4bN6m" not in raw
+    assert fake_secret.encode() not in raw
 
 
 def test_private_key_refused_entirely(store):

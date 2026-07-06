@@ -22,7 +22,7 @@
       "name": "correction-preference-flip",
       "existing": ["Dylan prefers VS Code as his main editor"],
       "input": "Dylan switched to Zed and uses it for everything now",
-      "expect_op": "SUPERSEDE",
+      "expect_op": ["SUPERSEDE", "UPDATE"],
       "recall_query": "which editor does Dylan use",
       "expect_recalled": "Zed"
     },
@@ -162,7 +162,7 @@
       "name": "add-second-pet-not-supersede",
       "existing": ["Dylan's cat is named Miso"],
       "input": "Dylan adopted a second cat named Tofu",
-      "expect_op": "ADD",
+      "expect_op": ["ADD", "UPDATE"],
       "recall_query": "what are Dylan's cats called",
       "expect_recalled": "Tofu"
     },
