@@ -4,10 +4,10 @@
     {
       "name": "correction-explicit",
       "existing": ["Dylan lives in Paris"],
-      "input": "Correction: Dylan lives in Berlin now",
+      "input": "Correction: Dylan lives in New York City now",
       "expect_op": "SUPERSEDE",
       "recall_query": "what city does Dylan live in",
-      "expect_recalled": "Berlin",
+      "expect_recalled": "New York City",
       "expect_not_recalled": "Paris"
     },
     {
