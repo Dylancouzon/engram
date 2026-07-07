@@ -249,7 +249,7 @@ def test_rebuild_from_journal_alone(config):
     store.forget(b.memory.id, mode="hard")
     store.close()
 
-    shutil.rmtree(config.shard_dir)
+    shutil.rmtree(config.shard_path("private"))
     reopened = make_store(config)
     try:
         reopened.rebuild()

@@ -79,11 +79,6 @@ class Config:
         return self.shards_root / shard.replace(":", "__")
 
     @property
-    def shard_dir(self) -> Path:
-        """The default (private) shard — kept for M0-era callers."""
-        return self.shard_path("private")
-
-    @property
     def models_dir(self) -> Path:
         # Deliberately NOT inside data_dir: the memory folder stays small and
         # portable; models are a per-machine tier, re-provisioned from the

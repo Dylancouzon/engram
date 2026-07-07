@@ -11,7 +11,6 @@ lockfile and serializes writes); Edge itself provides no locking in the
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,7 +40,7 @@ from qdrant_edge import (
 )
 
 from engram.embed import Embedded
-from engram.models import Memory, now_ts
+from engram.models import Memory
 
 DENSE = "dense"
 SPARSE = "sparse"
@@ -55,7 +54,6 @@ class Hit:
     id: str
     score: float
     payload: dict[str, Any]
-    raw: float = 0.0  # pre-normalization retrieval score (absolute scale)
 
     def memory(self) -> Memory:
         return Memory.from_payload(self.id, self.payload)
@@ -91,7 +89,6 @@ def build_filter(
 
 class EdgeBackend:
     def __init__(self, shard_dir: Path, dense_dim: int):
-        self._dir = shard_dir
         if shard_dir.exists() and any(shard_dir.iterdir()):
             self._shard = EdgeShard.load(str(shard_dir))
         else:
@@ -177,9 +174,6 @@ class EdgeBackend:
         after this returns."""
         self._shard.flush()
 
-    def optimize(self) -> bool:
-        return self._shard.optimize()
-
     def close(self) -> None:
         self._shard.close()
 
@@ -254,11 +248,3 @@ class EdgeBackend:
 
     def count(self) -> int:
         return self._shard.info().points_count
-
-    @staticmethod
-    def currently_valid_filter(**kwargs: Any) -> Filter | None:
-        return build_filter(valid_at=now_ts(), **kwargs)
-
-    @staticmethod
-    def now() -> float:
-        return time.time()

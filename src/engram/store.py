@@ -485,9 +485,11 @@ class MemoryStore:
             tags=tags,
             valid_at=as_of if as_of is not None else now_ts(),
         )
-        # Fan out across shards (Edge fuses only within one). Per-shard
-        # scores are min-max normalized before merging, ids dedup with
-        # private winning ties, and the rescore has over-fetch headroom.
+        # Fan out across shards (Edge fuses only within one), dedup by id with
+        # private winning ties, and let the rescore work off the over-fetch.
+        # Every shard uses the same embedding model, so raw scores ARE
+        # comparable across shards; normalizing per shard would let a weak
+        # shard's best hit outrank a strong shard's real match.
         shards = [shard] if shard else sorted(
             self.backends, key=lambda n: n != "private"
         )
@@ -498,11 +500,6 @@ class MemoryStore:
                     emb, k=k * 3, flt=flt, prefetch_limit=self.config.prefetch_limit,
                     mmr_lambda=self.config.mmr_lambda,
                 )
-                # Every shard uses the same embedding model, so raw scores ARE
-                # comparable across shards; normalizing per shard would let a
-                # weak shard's best hit outrank a strong shard's real match.
-                for h in shard_hits:
-                    h.raw = h.score
                 seen_ids = {h.id for h in hits}
                 hits.extend(h for h in shard_hits if h.id not in seen_ids)
 
@@ -516,7 +513,7 @@ class MemoryStore:
             w_rec, w_imp = self.config.weight_recency, self.config.weight_importance
             blend = (1 - w_rec - w_imp) + w_rec * recency + w_imp * m.importance
             rescored.append(RecallHit(memory=m, score=max(h.score, 0.0) * blend,
-                                      similarity=h.raw))
+                                      similarity=h.score))
         rescored.sort(key=lambda r: r.score, reverse=True)
         top = rescored[:k]
 

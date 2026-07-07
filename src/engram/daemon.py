@@ -144,11 +144,9 @@ class Daemon:
         """Wait for in-flight requests before closing the store. Stragglers
         past the timeout get errors — safe, because durability lives in the
         journal ack, not the connection."""
-        import time as _time
-
-        deadline = _time.monotonic() + timeout
+        deadline = _monotonic() + timeout
         with self._inflight_cond:
-            while self._inflight and _time.monotonic() < deadline:
+            while self._inflight and _monotonic() < deadline:
                 self._inflight_cond.wait(timeout=0.5)
 
     # -- request dispatch ------------------------------------------------------
