@@ -232,6 +232,19 @@ class Daemon:
     def _m_stats(self, params: dict, scopes: list[str], client: str) -> dict:
         return self.store.stats()
 
+    def _m_reviews(self, params: dict, scopes: list[str], client: str) -> dict:
+        from engram.protocol import review_to_wire
+
+        _check_scope(scopes, "*")  # owner decision, full access only
+        return {"reviews": [review_to_wire(i) for i in self.store.pending_reviews()]}
+
+    def _m_resolve_review(self, params: dict, scopes: list[str], client: str) -> dict:
+        _check_scope(scopes, "*")
+        item = self.store.resolve_review(int(params["seq"]), bool(params["accept"]))
+        if item is None:
+            raise ProtocolError(E_NOT_FOUND, f"no pending review {params['seq']}")
+        return {"resolved": True, "accepted": bool(params["accept"])}
+
     def _m_export(self, params: dict, scopes: list[str], client: str) -> dict:
         _check_scope(scopes, "*", code=E_SCOPE_DENIED)  # full-store op: * only
         import io

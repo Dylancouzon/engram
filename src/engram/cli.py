@@ -133,6 +133,10 @@ def remember(data_dir: str | None, text: str, mtype: str | None, tags: str | Non
                        click.style(f"({_short(action.memory.id)})", fg="cyan"))
         if action.op is Op.SUPERSEDE and action.target:
             click.echo(click.style(f"  ↳ replaces: {action.target.text}", dim=True))
+        if action.queued_review:
+            click.echo(click.style(
+                "  ? may conflict with an existing memory — run `engram review`",
+                fg="yellow"))
         if action.redaction_hits:
             click.echo(click.style(
                 f"  ⚠ redacted before storing: {', '.join(sorted(set(action.redaction_hits)))}",
@@ -309,6 +313,39 @@ def rebuild(data_dir: str | None) -> None:
     with _open_store(data_dir) as store:
         applied = store.rebuild()
     click.echo(f"rebuilt index from journal: {applied} operations replayed.")
+
+
+@main.command()
+@click.option("--list", "list_only", is_flag=True, help="List without prompting.")
+@click.pass_obj
+def review(data_dir: str | None, list_only: bool) -> None:
+    """Decide queued conflicts: writes the judge wasn't sure about were
+    stored as separate memories; accept to apply the suspected
+    update/supersede, reject to keep both."""
+    with _open_surface(data_dir) as store:
+        items = store.pending_reviews()
+        if not items:
+            click.echo("nothing to review.")
+            return
+        for item in items:
+            op = item.proposed_op.value.lower()
+            click.echo(click.style(f"\n[{op}? {item.confidence:.0%}]", fg="yellow",
+                                   bold=True) + f" (review {item.seq})")
+            click.echo(f"  existing: {item.target.text}")
+            click.echo(f"       new: {item.new.text}")
+            if item.merged_text:
+                click.echo(click.style(f"    merged: {item.merged_text}", dim=True))
+            if list_only:
+                continue
+            choice = click.prompt(
+                f"  apply {op}? [a]ccept / [r]eject / [s]kip", default="s",
+                show_default=False)
+            if choice.lower().startswith("a"):
+                store.resolve_review(item.seq, accept=True)
+                click.echo(click.style(f"  applied {op}.", fg="green"))
+            elif choice.lower().startswith("r"):
+                store.resolve_review(item.seq, accept=False)
+                click.echo("  kept both.")
 
 
 @main.command()

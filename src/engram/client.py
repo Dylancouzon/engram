@@ -162,6 +162,19 @@ class Client:
     def stats(self) -> dict:
         return dict(self.call("stats"))
 
+    def pending_reviews(self) -> list:
+        from engram.protocol import review_from_wire
+
+        return [review_from_wire(r) for r in self.call("reviews")["reviews"]]
+
+    def resolve_review(self, seq: int, accept: bool) -> bool:
+        try:
+            return bool(self.call("resolve_review", seq=seq, accept=accept)["resolved"])
+        except ProtocolError as e:
+            if e.code == "not_found":
+                return False
+            raise
+
     def export_jsonl(self) -> str:
         return self.call("export")["jsonl"]
 

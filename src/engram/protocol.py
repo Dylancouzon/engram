@@ -104,6 +104,31 @@ def hit_from_wire(data: dict[str, Any]) -> RecallHit:
     )
 
 
+def review_to_wire(item: Any) -> dict[str, Any]:
+    return {
+        "seq": item.seq,
+        "proposed_op": item.proposed_op.value,
+        "new": memory_to_wire(item.new),
+        "target": memory_to_wire(item.target),
+        "confidence": item.confidence,
+        "merged_text": item.merged_text,
+    }
+
+
+def review_from_wire(data: dict[str, Any]) -> Any:
+    from engram.models import Op
+    from engram.store import ReviewItem
+
+    return ReviewItem(
+        seq=data["seq"],
+        proposed_op=Op(data["proposed_op"]),
+        new=memory_from_wire(data["new"]),
+        target=memory_from_wire(data["target"]),
+        confidence=data.get("confidence", 0.0),
+        merged_text=data.get("merged_text"),
+    )
+
+
 def action_to_wire(a: WriteAction) -> dict[str, Any]:
     return {
         "op": a.op.value,
@@ -111,6 +136,7 @@ def action_to_wire(a: WriteAction) -> dict[str, Any]:
         "target": memory_to_wire(a.target) if a.target else None,
         "confidence": a.confidence,
         "redaction_hits": a.redaction_hits,
+        "queued_review": a.queued_review,
     }
 
 
@@ -123,4 +149,5 @@ def action_from_wire(data: dict[str, Any]) -> WriteAction:
         target=memory_from_wire(data["target"]) if data.get("target") else None,
         confidence=data.get("confidence", 1.0),
         redaction_hits=list(data.get("redaction_hits") or []),
+        queued_review=bool(data.get("queued_review", False)),
     )

@@ -104,6 +104,20 @@ class WriteAction:
     target: Memory | None = None  # the pre-existing memory affected
     confidence: float = 1.0
     redaction_hits: list[str] = field(default_factory=list)
+    queued_review: bool = False  # ADDed safely, judged op awaits review
+
+
+@dataclass
+class ReviewItem:
+    """An ambiguous verdict waiting for the owner's call: the new fact was
+    ADDed (safe), and accepting applies the judged op after the fact."""
+
+    seq: int  # journal seq of the review row = its id
+    proposed_op: Op
+    new: Memory
+    target: Memory
+    confidence: float
+    merged_text: str | None = None
 
 
 class MemoryStore:
@@ -339,7 +353,30 @@ class MemoryStore:
                                confidence=verdict.confidence)
 
         self._commit_upserts([new])
-        return WriteAction(op=Op.ADD, memory=new, confidence=verdict.confidence)
+
+        # Ambiguous UPDATE/SUPERSEDE: the ADD above is the safe floor, and
+        # the judged op is queued for the owner to accept or reject.
+        queue = (
+            not confident
+            and verdict.op in (Op.UPDATE, Op.SUPERSEDE)
+            and verdict.target is not None
+            and verdict.confidence >= self.config.review_floor
+        )
+        if queue:
+            seq = self.journal.append(
+                "review",
+                new.id,
+                {
+                    "proposed_op": verdict.op.value,
+                    "target_id": verdict.target.id,
+                    "confidence": verdict.confidence,
+                    "merged_text": verdict.merged_text,
+                },
+            )
+            self._applied_seq = max(self._applied_seq, seq)
+            self.journal.mark_flushed(seq)  # no Edge effect; durable at append
+        return WriteAction(op=Op.ADD, memory=new, confidence=verdict.confidence,
+                           queued_review=queue)
 
     def _commit_upserts(self, memories: list[Memory]) -> None:
         intents = []
@@ -498,6 +535,68 @@ class MemoryStore:
             self.backend.flush()
             self.journal.mark_flushed(self._applied_seq)
         shutil.rmtree(trash)
+
+    # -- review queue ----------------------------------------------------------
+
+    def pending_reviews(self) -> list[ReviewItem]:
+        """Ambiguous verdicts awaiting the owner's call, oldest first.
+        Items whose memories have since vanished (forgotten, superseded)
+        are silently dropped — the question answered itself."""
+        resolved = {
+            e.payload["review_seq"]
+            for e in self.journal.entries()
+            if e.op == "review_resolved" and e.payload
+        }
+        items: list[ReviewItem] = []
+        for e in self.journal.entries():
+            if e.op != "review" or e.seq in resolved or e.payload is None:
+                continue
+            new = self.get(e.memory_id)
+            target = self.get(e.payload["target_id"])
+            if new is None or target is None or not target.is_valid:
+                continue
+            items.append(ReviewItem(
+                seq=e.seq,
+                proposed_op=Op(e.payload["proposed_op"]),
+                new=new,
+                target=target,
+                confidence=e.payload.get("confidence", 0.0),
+                merged_text=e.payload.get("merged_text"),
+            ))
+        return items
+
+    def resolve_review(self, seq: int, accept: bool) -> ReviewItem | None:
+        """Apply or dismiss a queued verdict. Accepting a SUPERSEDE
+        invalidates the target in favor of the ADDed memory; accepting an
+        UPDATE folds the merged text into the target and removes the ADDed
+        twin. Rejecting keeps both memories as they are."""
+        with self._write_lock:
+            item = next((i for i in self.pending_reviews() if i.seq == seq), None)
+            if item is None:
+                return None
+            if accept and item.proposed_op is Op.SUPERSEDE:
+                old = item.target
+                old.valid_to = now_ts()
+                old.superseded_by = item.new.id
+                self._commit_upserts([old])
+            elif accept and item.proposed_op is Op.UPDATE:
+                target = item.target
+                target.text = item.merged_text or item.new.text
+                target.importance = max(target.importance, item.new.importance)
+                target.tags = list(dict.fromkeys(target.tags + item.new.tags))
+                # The ADDed twin folds into the target: journal the delete so
+                # a rebuild converges to the same state.
+                delete_seq = self.journal.append("delete", item.new.id)
+                self.backend.delete([item.new.id])
+                self._applied_seq = max(self._applied_seq, delete_seq)
+                self._commit_upserts([target])
+            resolved_seq = self.journal.append(
+                "review_resolved", item.new.id,
+                {"review_seq": seq, "accepted": accept},
+            )
+            self._applied_seq = max(self._applied_seq, resolved_seq)
+            self.journal.mark_flushed(resolved_seq)
+            return item
 
     # -- maintenance ---------------------------------------------------------------
 

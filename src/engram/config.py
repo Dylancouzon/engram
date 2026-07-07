@@ -37,6 +37,8 @@ class Config:
     # Write model
     salience_floor: float = 0.1  # extraction results below this are dropped
     judge_confidence: float = 0.8  # auto-apply UPDATE/SUPERSEDE at or above this
+    review_floor: float = 0.5  # UPDATE/SUPERSEDE between floor and judge_confidence
+    #   are applied as ADD and queued for review (below the floor: plain ADD)
     conflict_top_k: int = 5  # similar memories retrieved for the judge
     conflict_min_similarity: float = 0.6  # candidates below this aren't conflicts
     noop_similarity: float = 0.9  # NOOP verdicts stand at any confidence above this
