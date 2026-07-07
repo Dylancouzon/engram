@@ -157,9 +157,9 @@ def test_token_required_and_verified(config, daemon):  # noqa: F811
         with pytest.raises(ProtocolError) as exc:
             c.recall("anything")
         assert exc.value.code == "unregistered_client"
-    with Client(config, "phone", token="egt_wrong").connect() as c:
-        with pytest.raises(ProtocolError):
-            c.recall("anything")
+    with Client(config, "phone", token="egt_wrong").connect() as c, \
+            pytest.raises(ProtocolError):
+        c.recall("anything")
     with Client(config, "phone", token=token).connect() as c:
         assert c.ping()
         c.remember("token-authed write")

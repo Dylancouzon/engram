@@ -364,18 +364,58 @@ def review(data_dir: str | None, list_only: bool) -> None:
 
 
 @main.command()
+@click.option("--install", is_flag=True,
+              help="Install as a launchd agent (macOS) so the daemon starts"
+                   " at login, then exit.")
 @click.pass_obj
-def daemon(data_dir: str | None) -> None:
+def daemon(data_dir: str | None, install: bool) -> None:
     """Run the engram daemon: the single owner of your memory, serving the
     local API every other surface (CLI, MCP, importers) talks to."""
     from engram.daemon import run_daemon
 
     cfg = _config(data_dir)
+    if install:
+        _install_launchd(cfg)
+        return
     click.echo(f"engram daemon starting on {cfg.socket_path}")
     try:
         run_daemon(cfg)
     except StoreLockedError as e:
         raise click.ClickException(str(e)) from e
+
+
+def _install_launchd(cfg: Config) -> None:
+    import plistlib
+    import shutil as _shutil
+    import subprocess
+    import sys as _sys
+
+    if _sys.platform != "darwin":
+        raise click.ClickException("--install supports macOS (launchd) for now;"
+                                   " use a systemd user unit on Linux")
+    binary = _shutil.which("engram")
+    args = ([binary, "daemon"] if binary
+            else [_sys.executable, "-m", "engram.cli", "daemon"])
+    plist = {
+        "Label": "tech.qdrant.engram",
+        "ProgramArguments": args,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "EnvironmentVariables": {"ENGRAM_HOME": str(cfg.data_dir)},
+        "StandardErrorPath": str(cfg.data_dir / "daemon.log"),
+        "StandardOutPath": str(cfg.data_dir / "daemon.log"),
+    }
+    dest = Path.home() / "Library" / "LaunchAgents" / "tech.qdrant.engram.plist"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(plistlib.dumps(plist))
+    subprocess.run(["launchctl", "unload", str(dest)], capture_output=True)
+    result = subprocess.run(["launchctl", "load", "-w", str(dest)],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        raise click.ClickException(f"launchctl load failed: {result.stderr.strip()}")
+    click.echo(f"installed and started: {dest}")
+    click.echo("uninstall with: launchctl unload -w "
+               f"{dest} && rm {dest}")
 
 
 @main.group()
@@ -592,10 +632,8 @@ def sync_now(data_dir: str | None, shard: str | None) -> None:
     with _open_surface(data_dir) as store:
         for name in shards:
             try:
-                if isinstance(store, Client):
-                    report = store.sync(name)
-                else:
-                    report = sync_shard(store, name)
+                report = (store.sync(name) if isinstance(store, Client)
+                          else sync_shard(store, name))
             except SyncError as e:
                 raise click.ClickException(str(e)) from e
             summary = ", ".join(f"{k} {v}" for k, v in report.items())
