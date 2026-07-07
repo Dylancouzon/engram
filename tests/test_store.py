@@ -28,6 +28,27 @@ def test_recall_reinforces(store):
     assert second.memory.last_accessed is not None
 
 
+def test_reinforcement_does_not_grow_journal(config):
+    # A store meant to last years must not let reads inflate the source of
+    # truth: many recalls collapse to one reinforce row, and the accumulated
+    # count survives a restart.
+    store = make_store(config)
+    store.remember("Dylan drinks oat-milk flat whites")
+    for _ in range(20):
+        store.recall("coffee oat milk drinks")
+    assert store.journal.row_count == 2  # one upsert + one collapsed reinforce
+    mid = store.recall("coffee oat milk drinks", reinforce=False)[0].memory.id
+    store.close()
+
+    reopened = make_store(config)
+    try:
+        m = reopened.get(mid)
+        assert m.access_count >= 20  # count preserved across restart
+        assert reopened.journal.row_count == 2
+    finally:
+        reopened.close()
+
+
 def test_second_writer_locked_out(config):
     s1 = make_store(config)
     try:

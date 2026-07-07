@@ -151,6 +151,28 @@ class Journal:
                 seqs.append(cur.lastrowid)
         return seqs
 
+    def reinforce(self, memory_id: str, payload: dict[str, Any],
+                  shard: str = "private") -> int:
+        """Record an access bump, collapsing to at most one reinforce row per
+        memory. Access counts are absolute, so only the latest matters; keeping
+        one row per id (instead of appending per read) means the journal — the
+        source of truth this store exports, syncs and replays — grows with
+        write volume, not read volume. A memory recalled for years stays one
+        row. Returns the new row's seq: because `seq` is AUTOINCREMENT (never
+        reused, even after a delete), the replacement always sits above the row
+        it replaced, so replay and flush ordering are unaffected. That
+        no-reuse guarantee is load-bearing — do not drop AUTOINCREMENT."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM journal WHERE memory_id = ? AND op = 'reinforce'",
+                (memory_id,))
+            cur = self._conn.execute(
+                "INSERT INTO journal (op, memory_id, idempotency_key, payload, ts, shard)"
+                " VALUES ('reinforce', ?, NULL, ?, ?, ?)",
+                (memory_id, json.dumps(payload, ensure_ascii=False),
+                 time.time(), shard))
+            return cur.lastrowid
+
     # -- flush high-water mark --------------------------------------------
 
     @property
@@ -182,6 +204,14 @@ class Journal:
         with self._lock:
             row = self._conn.execute("SELECT MAX(seq) FROM journal").fetchone()
         return row[0] or 0
+
+    @property
+    def row_count(self) -> int:
+        """Actual rows in the log (what determines size). Diverges from
+        last_seq once reinforce rows collapse: the AUTOINCREMENT keeps
+        climbing, the row count does not."""
+        with self._lock:
+            return self._conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0]
 
     # -- forgetting ---------------------------------------------------------
 
@@ -238,10 +268,16 @@ class Journal:
             return {r[0] for r in rows}
 
     def last_ts_for(self, memory_id: str) -> float:
-        """Most recent journal activity for an id — the LWW clock for sync."""
+        """The LWW clock for sync: the last time this memory's CONTENT changed.
+        Only content-writing ops count. Read bumps (`reinforce`) and audit rows
+        (`noop`, `review`) carry fresh timestamps but change nothing, so
+        counting them would let a local recall or a local dedup shadow a genuine
+        remote edit (older-but-real) and silently drop it on the next pull."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT MAX(ts) FROM journal WHERE memory_id = ?", (memory_id,)
+                "SELECT MAX(ts) FROM journal WHERE memory_id = ?"
+                " AND op IN ('upsert', 'delete', 'sync-pull')",
+                (memory_id,),
             ).fetchone()
         return row[0] or 0.0
 

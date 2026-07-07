@@ -61,6 +61,27 @@ def test_two_device_sync_roundtrip(tmp_path, cloud):
         b.close()
 
 
+def test_reinforce_churn_does_not_drop_content_from_sync(tmp_path, cloud):
+    # Reinforce collapse churns the journal's max seq (delete+reinsert at a
+    # fresh seq on every recall). A content upsert written after that churn
+    # must still be pushed: read bumps must never advance the sync high-water
+    # mark past an unpushed content write.
+    a = _device(tmp_path, "device-a")
+    b = _device(tmp_path, "device-b", key_from=a.config)
+    try:
+        a.remember("Dylan's cat is named Miso", shard="me-synced")
+        for _ in range(5):
+            a.recall("cat name")  # reinforce churn between the two content writes
+        a.remember("Dylan flies to Berlin on Friday", shard="me-synced")
+        sync_shard(a, "me-synced", client=cloud)
+        assert sync_shard(b, "me-synced", client=cloud)["applied"] == 2
+        assert any("Miso" in h.memory.text for h in b.recall("cat name"))
+        assert any("Berlin" in h.memory.text for h in b.recall("flight Berlin"))
+    finally:
+        a.close()
+        b.close()
+
+
 def test_relay_holds_only_ciphertext(tmp_path, cloud):
     a = _device(tmp_path, "device-a")
     try:
@@ -150,7 +171,7 @@ def test_relay_cannot_swap_blob_between_ids(tmp_path, cloud):
             id="00000000-0000-4000-8000-000000000999",
             vector={"relay": [0.0]},
             payload={"op": "upsert", "blob": blob, "ts": 9e9, "device": "evil"})])
-        report = sync_shard(b, "me-synced", client=cloud)
+        sync_shard(b, "me-synced", client=cloud)
         # B applies the genuine point but rejects the swapped one (id mismatch
         # inside the authenticated blob).
         assert b.get(act.memory.id) is not None

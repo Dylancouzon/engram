@@ -47,6 +47,35 @@ def test_hard_forget_scrubs_and_tombstones(tmp_path):
     assert b"innocuous" in raw
 
 
+def test_reinforce_collapses_to_one_row(tmp_path):
+    # Reads must not grow the source of truth: a memory recalled a thousand
+    # times keeps exactly one reinforce row, holding the latest absolute count.
+    j = Journal(tmp_path / "j.db")
+    up = j.append("upsert", "id-1", {"text": "fact"})
+    last = up
+    for count in range(1, 1001):
+        last = j.reinforce("id-1", {"access_count": count, "last_accessed": 1.0})
+    rows = j.entries()
+    assert [e.op for e in rows] == ["upsert", "reinforce"]  # not 1001 rows
+    assert j.row_count == 2
+    assert rows[-1].payload["access_count"] == 1000  # latest count preserved
+    assert last > up  # new seq stays above what it replaced (replay ordering)
+
+
+def test_lww_clock_ignores_reads_and_audit_rows(tmp_path):
+    # The sync LWW clock must track the last CONTENT change, not activity.
+    # A later read bump (reinforce) and a later dedup no-op both carry fresh
+    # timestamps; if they moved the clock, a local recall or dedup would shadow
+    # a genuine (older but real) remote edit and silently drop it on pull.
+    j = Journal(tmp_path / "j.db")
+    j.append("upsert", "id-1", {"text": "x"}, ts=100.0)
+    j.reinforce("id-1", {"access_count": 1})           # ts = now, far above 100
+    j.append("noop", "id-1", {"dropped_text": "dup"})  # ts = now, far above 100
+    assert j.last_ts_for("id-1") == 100.0
+    j.append("sync-pull", "id-1", {"text": "y"}, ts=200.0)  # a real content write
+    assert j.last_ts_for("id-1") == 200.0
+
+
 def test_export_import_roundtrip(tmp_path):
     j = Journal(tmp_path / "j.db")
     j.append("upsert", "id-1", {"text": "fact one"})

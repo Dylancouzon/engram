@@ -543,7 +543,9 @@ class MemoryStore:
     def _apply_reinforce(self, bumps: Counter[str]) -> None:
         """Access bumps are journaled (so rebuilds keep them) but not
         flushed — they ride along with the next write's flush or close().
-        Replay is idempotent (absolute counts), so a crash loses nothing."""
+        Replay is idempotent (absolute counts), so a crash loses nothing.
+        journal.reinforce collapses to one row per memory: reads must not
+        grow the source of truth for a store meant to last years."""
         now = now_ts()
         for mid, n in bumps.items():
             shard = self.shard_of(mid)
@@ -555,7 +557,7 @@ class MemoryStore:
                 continue
             count = int(hit[0].payload.get("access_count") or 0) + n
             partial = {"access_count": count, "last_accessed": now}
-            seq = self.journal.append("reinforce", mid, partial, shard=shard)
+            seq = self.journal.reinforce(mid, partial, shard=shard)
             backend.set_payload(mid, partial)
             self._applied_seq = max(self._applied_seq, seq)
 
@@ -768,7 +770,7 @@ class MemoryStore:
         info: dict = {
             "points": sum(b.count() for b in self.backends.values()),
             "shards": {name: b.count() for name, b in sorted(self.backends.items())},
-            "journal_entries": self.journal.last_seq,
+            "journal_entries": self.journal.row_count,
             "flushed_seq": self.journal.flushed_seq,
             "tombstones": len(self.journal.tombstones()),
             "data_dir": str(self.config.data_dir),
