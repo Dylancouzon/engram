@@ -1,16 +1,16 @@
 """The local dashboard: one self-contained HTML file, generated on demand.
 
-This is the "what do you know about me" surface in visual form — a map of
-the memory space, every memory, the hook activity log, and store health,
-browsable in a browser. Deliberately a static snapshot, not a served app:
-no port, no server, no new attack surface; the file lands inside the 0700
-memory folder and never leaves the machine.
+This is the "what do you know about me" surface in visual form — an
+interactive map of the memory space, every memory, the hook activity log,
+and store health, browsable in a browser. Deliberately a static snapshot,
+not a served app: no port, no server, no new attack surface; the file lands
+inside the 0700 memory folder and never leaves the machine.
 
-The map is a force-directed layout over the memory embeddings: the store
-projects vectors to 2D (PCA seed) and hands over only coordinates + nearest
-neighbors — never raw vectors — and the browser settles the layout so
-similar memories pull together. Points are colored by scope (work / personal
-/ project) and fade with age; regions are labeled by their scope centroid.
+The map plots each memory at its position in the embedding space: the store
+projects the vectors to 2D (PCA) and hands over only coordinates + nearest
+neighbors — never raw vectors — and the browser draws an explorable scatter
+(scroll to zoom, drag to pan, hover to light up a memory's nearest
+neighbors, click to jump to it). Color is scope or type; points fade with age.
 """
 
 from __future__ import annotations
@@ -52,9 +52,15 @@ header p { color: var(--ink-2); font-size: 0.85rem; margin-top: 0.2rem; }
 .tile b { display: block; font-size: 1.45rem; font-weight: 650;
           font-variant-numeric: tabular-nums; }
 .tile span { font-size: 0.78rem; color: var(--ink-3); }
+.mapbar { display: flex; flex-wrap: wrap; gap: 0.5rem 0.9rem; align-items: center;
+          margin-bottom: 0.6rem; }
+.mapbar .grp { display: flex; gap: 0.3rem; align-items: center; }
+.mapbar .lbl { font-size: 0.75rem; color: var(--ink-3); text-transform: uppercase;
+               letter-spacing: 0.05em; }
 .mapwrap { position: relative; background: var(--surface); border: 1px solid var(--line);
            border-radius: 8px; overflow: hidden; }
-#map { display: block; width: 100%; height: 440px; touch-action: none; }
+#map { display: block; width: 100%; height: 480px; cursor: grab; touch-action: none; }
+#map.grabbing { cursor: grabbing; }
 .legend { display: flex; flex-wrap: wrap; gap: 0.4rem 0.9rem; padding: 0.6rem 0.9rem;
           border-top: 1px solid var(--line); font-size: 0.78rem; color: var(--ink-2); }
 .legend span { display: inline-flex; align-items: center; gap: 0.35rem; }
@@ -63,7 +69,8 @@ header p { color: var(--ink-2); font-size: 0.85rem; margin-top: 0.2rem; }
           background: var(--ink); color: var(--bg); padding: 0.4rem 0.6rem;
           border-radius: 6px; font-size: 0.8rem; line-height: 1.35;
           opacity: 0; transition: opacity 0.08s; box-shadow: 0 4px 14px rgba(0,0,0,.25); }
-.maphint { padding: 0 0.9rem 0.6rem; font-size: 0.75rem; color: var(--ink-3); }
+.maphint { position: absolute; right: 0.7rem; bottom: 0.5rem; font-size: 0.72rem;
+           color: var(--ink-3); pointer-events: none; }
 .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
             margin-bottom: 0.8rem; }
 .controls input[type=search] {
@@ -108,12 +115,18 @@ footer { margin-top: 2.5rem; color: var(--ink-3); font-size: 0.78rem; }
 <div class="tiles">__TILES__</div>
 
 <h2>Memory map</h2>
+<div class="mapbar">
+  <span class="grp"><span class="lbl">color</span>
+    <button class="chip" data-mode="scope">scope</button>
+    <button class="chip" data-mode="type">type</button></span>
+  <input type="search" id="mapq" class="chip" style="cursor:text"
+         placeholder="highlight…">
+</div>
 <div class="mapwrap" id="mapwrap">
   <canvas id="map"></canvas>
   <div id="maptip"></div>
+  <div class="maphint">scroll to zoom · drag to pan · hover for neighbors · dbl-click resets</div>
   <div class="legend" id="legend"></div>
-  <div class="maphint">Similar memories pull together; color is scope, fading with age.
-    Hover to read, click a point to jump to it below.</div>
 </div>
 
 <h2>Memories</h2>
@@ -218,176 +231,187 @@ document.getElementById("noevents").hidden = data.events.length > 0;
 
 render();
 
-// -- the memory map ---------------------------------------------------------
+// -- the interactive memory map --------------------------------------------
 (function () {
   const wrap = document.getElementById("mapwrap");
   const meta = new Map(data.memories.map(m => [m.id, m]));
-  // Only points we can also describe (join projection <-> memory rows).
   const nodes = (data.points || [])
     .filter(p => meta.has(p.id))
     .map(p => ({ id: p.id, neighbors: p.neighbors || [], m: meta.get(p.id),
-                 sx: p.x, sy: p.y, x: 0, y: 0, vx: 0, vy: 0 }));
+                 sx: p.x, sy: p.y, bx: 0, by: 0 }));
   if (nodes.length < 2) { wrap.style.display = "none"; return; }
   const byId = new Map(nodes.map(n => [n.id, n]));
-
-  // Scope drives color (meaning, not plumbing); age drives opacity.
-  const scopeColor = s => {
-    let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-    return `hsl(${h % 360} 65% 55%)`;
-  };
-  const times = nodes.map(n => n.m.created_at);
-  const lo = Math.min(...times), hi = Math.max(...times);
-  const alphaOf = n => 0.4 + 0.6 * ((n.m.created_at - lo) / ((hi - lo) || 1));
 
   const canvas = document.getElementById("map");
   const tip = document.getElementById("maptip");
   const ctx = canvas.getContext("2d");
-  let W = 0, H = 0, dpr = 1;
+  let W = 0, H = 0;
+  // view = pan/zoom on top of the fitted base positions; no physics — points
+  // sit at their real projected coordinates and stay there.
+  const view = { scale: 1, ox: 0, oy: 0 };
+  let colorMode = new Set(nodes.map(n => n.m.scope)).size > 1 ? "scope" : "type";
+  let hover = null, selected = null, filter = "";
 
-  // Seed positions from the PCA projection, scaled into the canvas box.
-  function seed() {
+  const PALETTE = ["#e8934a", "#4a9ce8", "#63b95e", "#c774d9", "#e0605f",
+                   "#42b8b8", "#d7a83e", "#8a7de0", "#5aa9d6", "#c98a5a"];
+  const cats = () => [...new Set(nodes.map(n => n.m[colorMode]))].sort();
+  const colorOf = n => PALETTE[Math.max(0, cats().indexOf(n.m[colorMode])) % PALETTE.length];
+
+  const times = nodes.map(n => n.m.created_at);
+  const lo = Math.min(...times), hi = Math.max(...times);
+  const ageAlpha = n => 0.5 + 0.5 * ((n.m.created_at - lo) / ((hi - lo) || 1));
+  const matches = n => !filter ||
+    (n.m.text + " " + n.m.tags.join(" ") + " " + n.m.scope).toLowerCase().includes(filter);
+
+  // Fit the projection into the canvas box; screen position adds pan/zoom.
+  function fit() {
     const xs = nodes.map(n => n.sx), ys = nodes.map(n => n.sy);
     const x0 = Math.min(...xs), x1 = Math.max(...xs);
     const y0 = Math.min(...ys), y1 = Math.max(...ys);
-    const pad = 46;
+    const pad = 52;
     nodes.forEach(n => {
-      n.x = pad + (W - 2 * pad) * ((n.sx - x0) / ((x1 - x0) || 1));
-      n.y = pad + (H - 2 * pad) * ((n.sy - y0) / ((y1 - y0) || 1));
+      n.bx = pad + (W - 2 * pad) * ((n.sx - x0) / ((x1 - x0) || 1));
+      n.by = pad + (H - 2 * pad) * ((n.sy - y0) / ((y1 - y0) || 1));
     });
   }
-
-  // Force step: neighbor springs pull similar memories together, global
-  // repulsion spreads the rest, weak centering keeps it framed.
-  // ponytail: O(n^2) repulsion, capped below; PCA seed alone past the cap.
-  const REP = 2600, SPRING = 0.02, REST = 46, CENTER = 0.004, DAMP = 0.86;
-  function stepPhysics() {
-    const cx = W / 2, cy = H / 2;
-    for (let i = 0; i < nodes.length; i++) {
-      const a = nodes[i]; let fx = 0, fy = 0;
-      for (let j = 0; j < nodes.length; j++) {
-        if (i === j) continue;
-        const b = nodes[j];
-        let dx = a.x - b.x, dy = a.y - b.y;
-        const d2 = dx * dx + dy * dy + 0.01;
-        const f = REP / d2;
-        fx += dx * f; fy += dy * f;
-      }
-      a.neighbors.forEach(nid => {
-        const b = byId.get(nid); if (!b) return;
-        const dx = b.x - a.x, dy = b.y - a.y;
-        const dist = Math.hypot(dx, dy) || 1;
-        const f = SPRING * (dist - REST);
-        fx += dx / dist * f * dist; fy += dy / dist * f * dist;
-      });
-      fx += (cx - a.x) * CENTER; fy += (cy - a.y) * CENTER;
-      a.vx = (a.vx + fx) * DAMP; a.vy = (a.vy + fy) * DAMP;
-    }
-    for (const a of nodes) {
-      a.x = Math.max(8, Math.min(W - 8, a.x + a.vx));
-      a.y = Math.max(8, Math.min(H - 8, a.y + a.vy));
-    }
-  }
+  const px = n => n.bx * view.scale + view.ox;
+  const py = n => n.by * view.scale + view.oy;
 
   function draw() {
     ctx.clearRect(0, 0, W, H);
-    // faint neighbor edges — structure, not clutter
-    ctx.lineWidth = 1;
-    for (const a of nodes) for (const nid of a.neighbors) {
-      const b = byId.get(nid); if (!b) continue;
-      ctx.strokeStyle = "rgba(128,128,128,0.10)";
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    const focus = hover || selected;
+    if (focus) {  // light up this memory's nearest neighbors
+      ctx.strokeStyle = "rgba(150,150,150,0.55)"; ctx.lineWidth = 1.3;
+      focus.neighbors.forEach(nid => {
+        const b = byId.get(nid); if (!b) return;
+        ctx.beginPath(); ctx.moveTo(px(focus), py(focus)); ctx.lineTo(px(b), py(b)); ctx.stroke();
+      });
     }
-    // scope-centroid labels (grounded: scope is known, not inferred)
-    const cents = {};
     for (const n of nodes) {
-      const s = n.m.scope; (cents[s] ||= { x: 0, y: 0, c: 0 });
-      cents[s].x += n.x; cents[s].y += n.y; cents[s].c++;
-    }
-    ctx.font = "600 12px -apple-system, sans-serif";
-    ctx.textAlign = "center";
-    for (const s in cents) {
-      const c = cents[s];
-      ctx.fillStyle = scopeColor(s);
-      ctx.globalAlpha = 0.9;
-      ctx.fillText(s, c.x / c.c, c.y / c.c - 12);
+      const on = matches(n), col = colorOf(n);
+      const big = (n === hover || n === selected);
+      ctx.beginPath(); ctx.arc(px(n), py(n), big ? 7 : 4.5, 0, 7);
+      if (!n.m.valid) {
+        ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+        ctx.globalAlpha = on ? 0.55 : 0.1; ctx.stroke();
+      } else {
+        ctx.fillStyle = col; ctx.globalAlpha = on ? ageAlpha(n) : 0.08; ctx.fill();
+      }
+      if (big && on) {
+        ctx.globalAlpha = 1; ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+      }
     }
     ctx.globalAlpha = 1;
-    // points
+    // category-centroid labels (grounded: scope/type are known, not inferred)
+    const cent = {};
     for (const n of nodes) {
-      ctx.beginPath(); ctx.arc(n.x, n.y, 5, 0, 7);
-      if (!n.m.valid) {
-        ctx.strokeStyle = scopeColor(n.m.scope); ctx.globalAlpha = 0.5;
-        ctx.lineWidth = 1.5; ctx.stroke();
-      } else {
-        ctx.fillStyle = scopeColor(n.m.scope); ctx.globalAlpha = alphaOf(n);
-        ctx.fill();
-      }
+      const k = n.m[colorMode]; (cent[k] ??= { x: 0, y: 0, c: 0 });
+      cent[k].x += px(n); cent[k].y += py(n); cent[k].c++;
+    }
+    ctx.font = "600 11px -apple-system, sans-serif"; ctx.textAlign = "center";
+    for (const k in cent) {
+      const c = cent[k];
+      ctx.fillStyle = PALETTE[Math.max(0, cats().indexOf(k)) % PALETTE.length];
+      ctx.globalAlpha = 0.85; ctx.fillText(k, c.x / c.c, c.y / c.c - 15);
     }
     ctx.globalAlpha = 1;
   }
 
   function resize() {
-    dpr = window.devicePixelRatio || 1;
+    const dpr = window.devicePixelRatio || 1;
     W = canvas.clientWidth; H = canvas.clientHeight;
     canvas.width = W * dpr; canvas.height = H * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    seed(); draw();
+    fit(); draw();
   }
   window.addEventListener("resize", resize);
   resize();
 
-  // Settle the layout (skip the animation for very large stores).
-  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  if (nodes.length <= 1500 && !reduce) {
-    let frame = 0;
-    (function tick() {
-      stepPhysics(); draw();
-      if (++frame < 180) requestAnimationFrame(tick);
-    })();
-  } else if (nodes.length <= 1500) {
-    for (let i = 0; i < 180; i++) stepPhysics();
-    draw();
-  }
-
-  // Hover -> tooltip; click -> jump to the memory's row.
   function nearest(mx, my) {
-    let best = null, bd = 12 * 12;
+    let best = null, bd = 13 * 13;
     for (const n of nodes) {
-      const dx = n.x - mx, dy = n.y - my, d = dx * dx + dy * dy;
+      const dx = px(n) - mx, dy = py(n) - my, d = dx * dx + dy * dy;
       if (d < bd) { bd = d; best = n; }
     }
     return best;
   }
-  canvas.addEventListener("mousemove", e => {
+
+  // Zoom toward the cursor.
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault();
     const r = canvas.getBoundingClientRect();
-    const n = nearest(e.clientX - r.left, e.clientY - r.top);
+    const mx = e.clientX - r.left, my = e.clientY - r.top;
+    const f = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+    view.scale = Math.max(0.4, Math.min(12, view.scale * f));
+    view.ox = mx - (mx - view.ox) * f;
+    view.oy = my - (my - view.oy) * f;
+    draw();
+  }, { passive: false });
+
+  // Drag to pan; a drag suppresses the click-to-select.
+  let drag = null, moved = false;
+  canvas.addEventListener("mousedown", e => {
+    drag = { x: e.clientX, y: e.clientY }; moved = false;
+  });
+  window.addEventListener("mousemove", e => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.hypot(dx, dy) > 3) { moved = true; canvas.classList.add("grabbing"); }
+    view.ox += dx; view.oy += dy; drag = { x: e.clientX, y: e.clientY }; draw();
+  });
+  window.addEventListener("mouseup", () => { drag = null; canvas.classList.remove("grabbing"); });
+
+  canvas.addEventListener("mousemove", e => {
+    if (drag) return;
+    const r = canvas.getBoundingClientRect();
+    const mx = e.clientX - r.left, my = e.clientY - r.top;
+    const n = nearest(mx, my);
+    if (n !== hover) { hover = n; draw(); }
     if (n) {
       tip.textContent = n.m.text;
-      tip.style.left = Math.min(e.clientX - r.left + 12, W - 20) + "px";
-      tip.style.top = (e.clientY - r.top + 12) + "px";
-      tip.style.opacity = 1; canvas.style.cursor = "pointer";
-    } else { tip.style.opacity = 0; canvas.style.cursor = "default"; }
+      tip.style.left = Math.min(mx + 14, W - 20) + "px";
+      tip.style.top = (my + 14) + "px"; tip.style.opacity = 1;
+    } else { tip.style.opacity = 0; }
   });
-  canvas.addEventListener("mouseleave", () => { tip.style.opacity = 0; });
+  canvas.addEventListener("mouseleave", () => { tip.style.opacity = 0; hover = null; draw(); });
+
   canvas.addEventListener("click", e => {
+    if (moved) return;  // was a pan, not a pick
     const r = canvas.getBoundingClientRect();
     const n = nearest(e.clientX - r.left, e.clientY - r.top);
+    selected = n || null; draw();
     if (!n) return;
-    if (!n.m.valid && !state.invalid) {
-      document.getElementById("showinvalid").click();
-    }
+    if (!n.m.valid && !state.invalid) document.getElementById("showinvalid").click();
     const row = rows.querySelector(`tr[data-id="${CSS.escape(n.id)}"]`);
     if (row) {
       row.scrollIntoView({ behavior: "smooth", block: "center" });
       row.classList.remove("flash"); void row.offsetWidth; row.classList.add("flash");
     }
   });
+  canvas.addEventListener("dblclick", () => {
+    view.scale = 1; view.ox = 0; view.oy = 0; selected = null; draw();
+  });
 
-  // Legend: one swatch per scope present.
-  const legend = document.getElementById("legend");
-  legend.innerHTML = [...new Set(nodes.map(n => n.m.scope))].sort()
-    .map(s => `<span><i style="background:${scopeColor(s)}"></i>${esc(s)}</span>`)
-    .join("");
+  // Live highlight from the map search box.
+  document.getElementById("mapq").addEventListener("input", e => {
+    filter = e.target.value.toLowerCase(); draw();
+  });
+
+  // Color-mode toggle + legend.
+  function buildLegend() {
+    document.getElementById("legend").innerHTML = cats().map((c, i) =>
+      `<span><i style="background:${PALETTE[i % PALETTE.length]}"></i>${esc(c)}</span>`).join("");
+  }
+  document.querySelectorAll(".mapbar [data-mode]").forEach(b => {
+    b.classList.toggle("on", b.dataset.mode === colorMode);
+    b.onclick = () => {
+      colorMode = b.dataset.mode;
+      document.querySelectorAll(".mapbar [data-mode]").forEach(x =>
+        x.classList.toggle("on", x.dataset.mode === colorMode));
+      buildLegend(); draw();
+    };
+  });
+  buildLegend();
 })();
 </script>
 </body>
