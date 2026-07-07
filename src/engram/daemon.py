@@ -18,6 +18,8 @@ import os
 import signal
 import socketserver
 import threading
+import time as _time
+from time import monotonic as _monotonic
 from typing import Any
 
 from engram.config import Config
@@ -42,6 +44,8 @@ from engram.protocol import (
 from engram.store import MemoryStore, WriteRefusedError
 
 REINFORCE_FLUSH_SECONDS = 30.0
+IDLE_FOR_CONSOLIDATION = 600.0  # no requests for 10 min
+CONSOLIDATE_EVERY = 86400.0  # at most daily
 
 # The CLI is the owner's own hands: implicitly registered, all scopes.
 _IMPLICIT_CLIENTS = {"cli": ["*"]}
@@ -103,6 +107,7 @@ class Daemon:
         self._stop = threading.Event()
         self._inflight = 0
         self._inflight_cond = threading.Condition()
+        self._last_request = 0.0
 
     def _track_request(self):
         import contextlib
@@ -255,6 +260,17 @@ class Daemon:
         n = self.store.export_jsonl(buf)
         return {"jsonl": buf.getvalue(), "entries": n}
 
+    def _m_consolidate(self, params: dict, scopes: list[str], client: str) -> dict:
+        _check_scope(scopes, "*")
+        return self.store.consolidate(budget=int(params.get("budget", 50)))
+
+    def _m_snapshot(self, params: dict, scopes: list[str], client: str) -> dict:
+        from pathlib import Path
+
+        _check_scope(scopes, "*")
+        size = self.store.snapshot(Path(params["path"]), params.get("passphrase"))
+        return {"bytes": size, "path": params["path"]}
+
     # -- server loop --------------------------------------------------------------
 
     def serve(self, ready: threading.Event | None = None,
@@ -284,6 +300,7 @@ class Daemon:
                         return
                     if message is None:
                         return
+                    daemon._last_request = _monotonic()
                     with daemon._track_request():
                         response = daemon.handle(message)
                     try:
@@ -325,9 +342,16 @@ class Daemon:
     def _flush_loop(self) -> None:
         import contextlib
 
+        from engram.consolidate import last_run
+
         while not self._stop.wait(REINFORCE_FLUSH_SECONDS):
             with contextlib.suppress(Exception):  # keep the flusher alive
                 self.store.flush_reinforce()
+            with contextlib.suppress(Exception):
+                idle = _monotonic() - self._last_request
+                if (self._last_request and idle >= IDLE_FOR_CONSOLIDATION
+                        and _time.time() - last_run(self.store) >= CONSOLIDATE_EVERY):
+                    self.store.consolidate(stop=self._stop)
 
 
 def run_daemon(config: Config | None = None) -> None:

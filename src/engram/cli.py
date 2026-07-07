@@ -420,6 +420,63 @@ def clients_list(data_dir: str | None) -> None:
         click.echo(f"{name:>16}: {', '.join(entry['scopes'])}")
 
 
+@main.command()
+@click.option("-o", "--output", required=True, type=click.Path(path_type=Path))
+@click.option("--passphrase", default=None,
+              help="Encryption passphrase (prompted if omitted).")
+@click.option("--no-encrypt", is_flag=True,
+              help="Write an unencrypted snapshot (not recommended off-device).")
+@click.pass_obj
+def snapshot(data_dir: str | None, output: Path, passphrase: str | None,
+             no_encrypt: bool) -> None:
+    """Back up your memory folder to one portable file (encrypted by
+    default). Restore anywhere with `engram restore`."""
+    if not no_encrypt and passphrase is None:
+        passphrase = click.prompt("snapshot passphrase", hide_input=True,
+                                  confirmation_prompt=True)
+    with _open_surface(data_dir) as store:
+        if isinstance(store, Client):
+            size = store.snapshot(str(output.resolve()),
+                                  None if no_encrypt else passphrase)
+        else:
+            size = store.snapshot(output, None if no_encrypt else passphrase)
+    enc = "unencrypted" if no_encrypt else "encrypted"
+    click.echo(f"wrote {enc} snapshot: {output} ({size / 1024:.0f} KiB)")
+
+
+@main.command()
+@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@click.option("--passphrase", default=None)
+@click.pass_obj
+def restore(data_dir: str | None, source: Path, passphrase: str | None) -> None:
+    """Restore a snapshot into an empty memory folder, then verify it."""
+    from engram.archive import restore_snapshot
+
+    cfg = _config(data_dir)
+    try:
+        restore_snapshot(cfg, source,
+                         passphrase or click.prompt("snapshot passphrase",
+                                                    hide_input=True, default="",
+                                                    show_default=False) or None)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    with _open_store(data_dir) as store:
+        info = store.stats()
+    click.echo(f"restored: {info['points']} memories across "
+               f"{len(info.get('shards', {}))} shard(s).")
+
+
+@main.command()
+@click.option("--budget", type=int, default=50, help="Max operations this run.")
+@click.pass_obj
+def consolidate(data_dir: str | None, budget: int) -> None:
+    """Housekeeping now instead of waiting for the daemon's idle run:
+    prune stale episodes, dedup, summarize old episodes into facts."""
+    with _open_surface(data_dir) as store:
+        report = store.consolidate(budget=budget)
+    click.echo(", ".join(f"{k} {v}" for k, v in report.items()) or "nothing to do")
+
+
 @main.group()
 def hook() -> None:
     """Proactive recall triggers for assistant surfaces."""

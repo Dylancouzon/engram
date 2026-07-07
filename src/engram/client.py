@@ -176,6 +176,12 @@ class Client:
                 return False
             raise
 
+    def consolidate(self, budget: int = 50) -> dict:
+        return dict(self.call("consolidate", budget=budget))
+
+    def snapshot(self, path: str, passphrase: str | None) -> int:
+        return int(self.call("snapshot", path=path, passphrase=passphrase)["bytes"])
+
     def export_jsonl(self) -> str:
         return self.call("export")["jsonl"]
 

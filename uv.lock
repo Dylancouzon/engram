@@ -151,6 +151,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
+    { name = "cryptography" },
     { name = "fastembed" },
     { name = "mcp" },
     { name = "qdrant-edge-py" },
@@ -165,6 +166,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.1" },
+    { name = "cryptography", specifier = ">=49.0.0" },
     { name = "fastembed", specifier = ">=0.8.0" },
     { name = "mcp", specifier = ">=1.28.1" },
     { name = "qdrant-edge-py", specifier = ">=0.7.2" },

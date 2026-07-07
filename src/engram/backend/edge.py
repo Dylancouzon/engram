@@ -35,6 +35,8 @@ from qdrant_edge import (
     Query,
     QueryRequest,
     RangeFloat,
+    ScalarQuantizationConfig,
+    ScalarType,
     ScrollRequest,
     SparseVector,
     UpdateOperation,
@@ -89,16 +91,22 @@ def build_filter(
 
 
 class EdgeBackend:
-    def __init__(self, shard_dir: Path, dense_dim: int):
+    def __init__(self, shard_dir: Path, dense_dim: int, quantize: bool = False):
         self._dir = shard_dir
         if shard_dir.exists() and any(shard_dir.iterdir()):
             self._shard = EdgeShard.load(str(shard_dir))
         else:
             shard_dir.mkdir(parents=True, exist_ok=True)
+            dense_params = EdgeVectorParams(
+                size=dense_dim,
+                distance=Distance.Cosine,
+                quantization_config=ScalarQuantizationConfig(ScalarType.Int8)
+                if quantize else None,
+            )
             self._shard = EdgeShard.create(
                 str(shard_dir),
                 EdgeConfig(
-                    vectors={DENSE: EdgeVectorParams(size=dense_dim, distance=Distance.Cosine)},
+                    vectors={DENSE: dense_params},
                     sparse_vectors={SPARSE: EdgeSparseVectorParams(modifier=Modifier.Idf)},
                 ),
             )

@@ -205,7 +205,8 @@ class MemoryStore:
         validate_shard(shard)
         if shard not in self.backends:
             self.backends[shard] = EdgeBackend(
-                self.config.shard_path(shard), dense_dim=self.config.dense_dim
+                self.config.shard_path(shard), dense_dim=self.config.dense_dim,
+                quantize=self.config.quantize,
             )
         return self.backends[shard]
 
@@ -219,7 +220,8 @@ class MemoryStore:
                     name = path.name.replace("__", ":")
                     if name not in self.backends and _SHARD_NAME.match(name):
                         self.backends[name] = EdgeBackend(
-                            path, dense_dim=self.config.dense_dim
+                            path, dense_dim=self.config.dense_dim,
+                            quantize=self.config.quantize,
                         )
 
     def shard_of(self, memory_id: str) -> str | None:
@@ -483,12 +485,19 @@ class MemoryStore:
                     emb, k=k * 3, flt=flt, prefetch_limit=self.config.prefetch_limit,
                     mmr_lambda=self.config.mmr_lambda,
                 )
-                if shard_hits:
+                if len(shard_hits) >= 3:
+                    # Enough hits for min-max to mean something.
                     lo = min(h.score for h in shard_hits)
                     hi = max(h.score for h in shard_hits)
                     span = (hi - lo) or 1.0
                     for h in shard_hits:
                         h.score = 0.5 if hi == lo else (h.score - lo) / span
+                else:
+                    # Degenerate result sets keep their raw score (clipped):
+                    # a lone weak match must not inflate to parity with a
+                    # lone strong one from another shard.
+                    for h in shard_hits:
+                        h.score = max(0.0, min(1.0, h.score))
                 seen_ids = {h.id for h in hits}
                 hits.extend(h for h in shard_hits if h.id not in seen_ids)
 
@@ -611,7 +620,8 @@ class MemoryStore:
             shard_dir = self.config.shard_path(shard)
             trash = shard_dir.with_name(shard_dir.name + ".purging")
             shard_dir.rename(trash)
-            new_backend = EdgeBackend(shard_dir, dense_dim=self.config.dense_dim)
+            new_backend = EdgeBackend(shard_dir, dense_dim=self.config.dense_dim,
+                                      quantize=self.config.quantize)
             self.backends[shard] = new_backend
             for point_id, vector, payload in survivors:
                 new_backend.upsert_raw(point_id, vector, payload)
@@ -681,6 +691,24 @@ class MemoryStore:
             self._applied_seq = max(self._applied_seq, resolved_seq)
             self.journal.mark_flushed(resolved_seq)
             return item
+
+    # -- backup / housekeeping ---------------------------------------------------
+
+    def snapshot(self, dest: Path, passphrase: str | None) -> int:
+        """Quiesced, encrypted-by-default backup of the memory folder."""
+        from engram.archive import write_snapshot
+
+        self.flush_reinforce()
+        with self._write_lock, self._shard_guard.exclusive():
+            for backend in self.backends.values():
+                backend.flush()
+            self.journal.mark_flushed(self._applied_seq)
+            return write_snapshot(self.config, dest, passphrase)
+
+    def consolidate(self, budget: int = 50, stop=None) -> dict[str, int]:
+        from engram.consolidate import consolidate
+
+        return consolidate(self, budget=budget, stop=stop)
 
     # -- maintenance ---------------------------------------------------------------
 

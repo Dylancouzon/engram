@@ -199,6 +199,23 @@ class Journal:
         with self._lock:
             return {r[0] for r in self._conn.execute("SELECT memory_id FROM tombstones")}
 
+    # -- generic meta ---------------------------------------------------------
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+
+    def get_meta(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+        return row[0] if row else None
+
     # -- trigger measurement ---------------------------------------------------
 
     def log_event(self, kind: str, hits: int = 0) -> None:
