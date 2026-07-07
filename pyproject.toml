@@ -13,6 +13,7 @@ dependencies = [
     "click>=8.1",
     "mcp>=1.28.1",
     "cryptography>=49.0.0",
+    "qdrant-client>=1.18.0",
 ]
 
 [project.scripts]

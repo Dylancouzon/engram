@@ -387,14 +387,27 @@ def clients() -> None:
 @click.argument("name")
 @click.option("--scopes", default="*",
               help="Comma-separated scope allowlist, or * for everything.")
+@click.option("--token", "with_token", is_flag=True,
+              help="Require a capability token (printed once, store it in the"
+                   " client's config as ENGRAM_TOKEN).")
+@click.option("--methods", default=None,
+              help="Comma-separated method grants (e.g. recall,remember)."
+                   " Default: all methods.")
 @click.pass_obj
-def clients_allow(data_dir: str | None, name: str, scopes: str) -> None:
+def clients_allow(data_dir: str | None, name: str, scopes: str,
+                  with_token: bool, methods: str | None) -> None:
     """Register a client (e.g. claude-code, cursor) and grant it scopes."""
     from engram.daemon import ClientRegistry
 
     scope_list = [s.strip() for s in scopes.split(",") if s.strip()]
-    ClientRegistry(_config(data_dir)).allow(name, scope_list)
-    click.echo(f"{name}: allowed scopes {', '.join(scope_list)}")
+    method_list = ([m.strip() for m in methods.split(",") if m.strip()]
+                   if methods else None)
+    token = ClientRegistry(_config(data_dir)).allow(
+        name, scope_list, token=with_token, methods=method_list)
+    click.echo(f"{name}: allowed scopes {', '.join(scope_list)}"
+               + (f", methods {', '.join(method_list)}" if method_list else ""))
+    if token:
+        click.echo(click.style(f"capability token (shown once): {token}", fg="yellow"))
 
 
 @clients.command("revoke")
@@ -522,13 +535,71 @@ def hook_print_config() -> None:
 @main.command()
 @click.option("--client", "client_name", required=True,
               help="Client name this MCP server represents (must be registered).")
+@click.option("--token", default=None, envvar="ENGRAM_TOKEN",
+              help="Capability token, if the registration requires one.")
 @click.pass_obj
-def mcp(data_dir: str | None, client_name: str) -> None:
+def mcp(data_dir: str | None, client_name: str, token: str | None) -> None:
     """Run the MCP server (stdio) — plugs engram into Claude Code, Claude
     Desktop, Cursor, or any MCP client. Starts the daemon if needed."""
     from engram.mcp_server import run_mcp
 
-    run_mcp(_config(data_dir), client_name)
+    run_mcp(_config(data_dir), client_name, token=token)
+
+
+@main.group()
+def sync() -> None:
+    """Opt-in sync of me-synced / shared:<group> shards through a Qdrant
+    Cloud collection. Payloads are encrypted with a key that never leaves
+    your devices; the private shard has no sync path at all."""
+
+
+@sync.command("setup")
+@click.option("--shard", required=True, help="me-synced or shared:<group>.")
+@click.option("--url", required=True, help="Qdrant Cloud cluster URL.")
+@click.option("--api-key", default=None, envvar="QDRANT_API_KEY")
+@click.option("--collection", default=None,
+              help="Collection name (default engram-<shard>).")
+@click.pass_obj
+def sync_setup(data_dir: str | None, shard: str, url: str,
+               api_key: str | None, collection: str | None) -> None:
+    """Point a shard at its relay collection and mint the local key."""
+    from engram.sync import SyncError, SyncTarget, save_target, sync_key
+
+    cfg = _config(data_dir)
+    try:
+        save_target(cfg, SyncTarget(
+            shard=shard, url=url, api_key=api_key,
+            collection=collection or f"engram-{shard.replace(':', '-')}"))
+    except (SyncError, ValueError) as e:
+        raise click.ClickException(str(e)) from e
+    sync_key(cfg)
+    click.echo(f"{shard}: sync target saved.")
+    click.echo(f"copy {cfg.data_dir / 'sync.key'} to your other devices "
+               "(it never syncs itself).")
+
+
+@sync.command("now")
+@click.option("--shard", default=None, help="One shard (default: all configured).")
+@click.pass_obj
+def sync_now(data_dir: str | None, shard: str | None) -> None:
+    """Push local changes, pull the union, merge (LWW + tombstones)."""
+    from engram.sync import SyncError, load_targets, sync_shard
+
+    cfg = _config(data_dir)
+    shards = [shard] if shard else list(load_targets(cfg))
+    if not shards:
+        raise click.ClickException("no shards configured; run engram sync setup")
+    with _open_surface(data_dir) as store:
+        for name in shards:
+            try:
+                if isinstance(store, Client):
+                    report = store.sync(name)
+                else:
+                    report = sync_shard(store, name)
+            except SyncError as e:
+                raise click.ClickException(str(e)) from e
+            summary = ", ".join(f"{k} {v}" for k, v in report.items())
+            click.echo(f"{name}: {summary}")
 
 
 if __name__ == "__main__":

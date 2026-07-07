@@ -64,17 +64,36 @@ class ClientRegistry:
         return {}
 
     def scopes_for(self, client: str) -> list[str] | None:
-        if client in _IMPLICIT_CLIENTS:
-            return _IMPLICIT_CLIENTS[client]
-        entry = self._load().get(client)
+        entry = self.entry_for(client)
         return list(entry.get("scopes", [])) if entry else None
 
-    def allow(self, client: str, scopes: list[str]) -> None:
+    def entry_for(self, client: str) -> dict | None:
+        if client in _IMPLICIT_CLIENTS:
+            return {"scopes": _IMPLICIT_CLIENTS[client]}
+        return self._load().get(client)
+
+    def allow(self, client: str, scopes: list[str], token: bool = False,
+              methods: list[str] | None = None) -> str | None:
+        """Register a client. With token=True a capability token is
+        generated and its hash stored; the plaintext is returned ONCE and
+        never persisted. `methods` optionally narrows which API methods the
+        client may call (per-tool grants)."""
         if not scopes:
             raise ValueError("scope allowlist cannot be empty (use '*' for everything)")
+        import hashlib
+        import secrets
+
+        entry: dict = {"scopes": scopes}
+        plaintext: str | None = None
+        if token:
+            plaintext = "egt_" + secrets.token_urlsafe(24)
+            entry["token_hash"] = hashlib.sha256(plaintext.encode()).hexdigest()
+        if methods:
+            entry["methods"] = methods
         data = self._load()
-        data[client] = {"scopes": scopes}
+        data[client] = entry
         self._write(data)
+        return plaintext
 
     def revoke(self, client: str) -> bool:
         data = self._load()
@@ -149,17 +168,34 @@ class Daemon:
             client = message.get("client")
             if not isinstance(client, str) or not client:
                 raise ProtocolError(E_BAD_REQUEST, "missing client name")
-            scopes = self.registry.scopes_for(client)
-            if scopes is None:
+            entry = self.registry.entry_for(client)
+            if entry is None:
                 raise ProtocolError(
                     E_UNREGISTERED,
                     f"client {client!r} is not registered; run: "
                     f"engram clients allow {client} --scopes <scopes|*>",
                 )
+            scopes = list(entry.get("scopes", []))
+            if entry.get("token_hash"):
+                import hashlib
+
+                supplied = message.get("token")
+                if (not isinstance(supplied, str)
+                        or hashlib.sha256(supplied.encode()).hexdigest()
+                        != entry["token_hash"]):
+                    raise ProtocolError(
+                        E_UNREGISTERED,
+                        f"client {client!r} requires a valid capability token",
+                    )
             method = message.get("method")
             params = message.get("params") or {}
             if not isinstance(params, dict):
                 raise ProtocolError(E_BAD_REQUEST, "params must be an object")
+            granted = entry.get("methods")
+            if granted and method not in granted and method != "ping":
+                raise ProtocolError(
+                    E_SCOPE_DENIED, f"client is not granted method {method!r}"
+                )
             handler = getattr(self, f"_m_{method}", None)
             if handler is None:
                 raise ProtocolError(E_BAD_REQUEST, f"unknown method {method!r}")
@@ -270,6 +306,12 @@ class Daemon:
         _check_scope(scopes, "*")
         size = self.store.snapshot(Path(params["path"]), params.get("passphrase"))
         return {"bytes": size, "path": params["path"]}
+
+    def _m_sync(self, params: dict, scopes: list[str], client: str) -> dict:
+        from engram.sync import sync_shard
+
+        _check_scope(scopes, "*")
+        return sync_shard(self.store, str(params["shard"]))
 
     # -- server loop --------------------------------------------------------------
 

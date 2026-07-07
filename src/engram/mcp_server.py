@@ -30,8 +30,8 @@ Corrections are handled automatically: remembering a fact that contradicts
 an old one supersedes it."""
 
 
-def run_mcp(config: Config, client_name: str) -> None:
-    client = Client(config, client_name)
+def run_mcp(config: Config, client_name: str, token: str | None = None) -> None:
+    client = Client(config, client_name, token=token)
     client.connect(spawn=True)
 
     def call(fn, *args, retry: bool = False, **kwargs):

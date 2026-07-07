@@ -37,9 +37,10 @@ class DaemonUnavailable(RuntimeError):
 
 
 class Client:
-    def __init__(self, config: Config, client_name: str):
+    def __init__(self, config: Config, client_name: str, token: str | None = None):
         self.config = config
         self.client_name = client_name
+        self.token = token or os.environ.get("ENGRAM_TOKEN")
         self._sock: socket.socket | None = None
         self._rfile = None
         self._wfile = None
@@ -107,13 +108,16 @@ class Client:
     def call(self, method: str, **params: Any) -> Any:
         if self._sock is None:
             raise DaemonUnavailable("not connected")
-        write_message(self._wfile, {
+        envelope = {
             "v": PROTOCOL_VERSION,
             "id": uuid.uuid4().hex[:8],
             "client": self.client_name,
             "method": method,
             "params": params,
-        })
+        }
+        if self.token:
+            envelope["token"] = self.token
+        write_message(self._wfile, envelope)
         response = read_message(self._rfile)
         if response is None:
             raise DaemonUnavailable("daemon closed the connection")
@@ -175,6 +179,9 @@ class Client:
             if e.code == "not_found":
                 return False
             raise
+
+    def sync(self, shard: str) -> dict:
+        return dict(self.call("sync", shard=shard))
 
     def consolidate(self, budget: int = 50) -> dict:
         return dict(self.call("consolidate", budget=budget))

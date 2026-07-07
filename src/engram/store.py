@@ -692,6 +692,20 @@ class MemoryStore:
             self.journal.mark_flushed(resolved_seq)
             return item
 
+    def apply_synced(self, memory: Memory, shard: str, remote_ts: float) -> None:
+        """Apply a memory pulled from a sync relay. Journaled as 'sync-pull'
+        so push never re-uploads it (no cross-device ping-pong); replay and
+        rebuild treat it exactly like an upsert."""
+        with self._write_lock:
+            backend = self._backend(shard)
+            seq = self.journal.append("sync-pull", memory.id, memory.to_payload(),
+                                      shard=shard)
+            emb = self.embedder.embed_documents([memory.text])[0]
+            backend.upsert(memory, emb)
+            self._applied_seq = max(self._applied_seq, seq)
+            backend.flush()
+            self.journal.mark_flushed(self._applied_seq)
+
     # -- backup / housekeeping ---------------------------------------------------
 
     def snapshot(self, dest: Path, passphrase: str | None) -> int:
@@ -810,7 +824,7 @@ class MemoryStore:
 
     def _apply_entry(self, entry: JournalEntry) -> None:
         backend = self._backend(entry.shard)
-        if entry.op == "upsert" and entry.payload is not None:
+        if entry.op in ("upsert", "sync-pull") and entry.payload is not None:
             memory = Memory.from_payload(entry.memory_id, entry.payload)
             emb = self.embedder.embed_documents([memory.text])[0]
             backend.upsert(memory, emb)

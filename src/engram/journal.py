@@ -199,6 +199,14 @@ class Journal:
         with self._lock:
             return {r[0] for r in self._conn.execute("SELECT memory_id FROM tombstones")}
 
+    def last_ts_for(self, memory_id: str) -> float:
+        """Most recent journal activity for an id — the LWW clock for sync."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(ts) FROM journal WHERE memory_id = ?", (memory_id,)
+            ).fetchone()
+        return row[0] or 0.0
+
     # -- generic meta ---------------------------------------------------------
 
     def set_meta(self, key: str, value: str) -> None:
