@@ -57,6 +57,7 @@ class Hit:
     id: str
     score: float
     payload: dict[str, Any]
+    raw: float = 0.0  # pre-normalization retrieval score (absolute scale)
 
     def memory(self) -> Memory:
         return Memory.from_payload(self.id, self.payload)

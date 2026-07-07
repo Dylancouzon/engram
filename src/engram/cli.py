@@ -562,13 +562,134 @@ def hook_session_start(data_dir: str | None, scope: str | None, k: int) -> None:
     click.echo("\n(Use the engram MCP tools to recall more or remember new facts.)")
 
 
+@hook.command("user-prompt")
+@click.option("--scope", default=None)
+@click.option("-k", type=int, default=4)
+@click.option("--min-score", type=float, default=0.5,
+              help="Minimum absolute similarity to inject (noise gate).")
+@click.pass_obj
+def hook_user_prompt(data_dir: str | None, scope: str | None, k: int,
+                     min_score: float) -> None:
+    """Claude Code UserPromptSubmit hook: recall against the prompt itself,
+    inject only confident hits. Deterministic recall-at-the-right-moment —
+    the model never has to remember to ask."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        payload = {}
+    prompt = (payload.get("prompt") or "").strip()
+    if len(prompt) < 12:  # nothing to match against
+        return
+    with _open_surface(data_dir) as store:
+        hits = [h for h in store.recall(prompt, k=k, scope=scope, reinforce=False)
+                if h.similarity >= min_score]
+        journal = getattr(store, "journal", None)
+        if journal is not None:
+            journal.log_event("prompt-recall", hits=len(hits))
+    if not hits:
+        return
+    click.echo("<engram-memories>")
+    for h in hits:
+        click.echo(f"- {h.memory.text}")
+    click.echo("</engram-memories>")
+
+
+@hook.command("capture")
+@click.option("--scope", default="default")
+@click.option("--max-chars", type=int, default=8000)
+@click.pass_obj
+def hook_capture(data_dir: str | None, scope: str, max_chars: int) -> None:
+    """Claude Code Stop hook: harvest memories from the conversation that
+    just ended. Runs the tail of the transcript through the full write
+    pipeline; extraction's salience gate + dedup keep it clean. No-ops
+    without a local extraction model (verbatim transcripts are not memories)."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return
+    transcript_path = payload.get("transcript_path")
+    if not transcript_path or not Path(transcript_path).exists():
+        return
+    texts: list[str] = []
+    for line in Path(transcript_path).read_text(errors="replace").splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        message = entry.get("message") or {}
+        if message.get("role") != "user":
+            continue  # the user's words carry the facts worth keeping
+        content = message.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text")
+    tail = "\n".join(t for t in texts if t and not t.startswith("<"))[-max_chars:]
+    if len(tail) < 40:
+        return
+    with _open_surface(data_dir) as store:
+        llm = getattr(store, "llm", None)
+        if llm is None or not llm.available():
+            if isinstance(store, MemoryStore):
+                return  # library mode without a model: skip, never store blobs
+        actions = store.remember(tail, scope=scope, surface="auto-capture",
+                                 source_ref=str(transcript_path))
+        journal = getattr(store, "journal", None)
+        if journal is not None:
+            journal.log_event("auto-capture", hits=len(actions))
+
+
+@hook.command("install")
+@click.argument("surface", type=click.Choice(["claude-code"]))
+@click.option("--yes", is_flag=True, help="Skip confirmation.")
+def hook_install(surface: str, yes: bool) -> None:
+    """Wire the hooks into ~/.claude/settings.json (backs it up first)."""
+    settings_path = Path.home() / ".claude" / "settings.json"
+    settings = {}
+    if settings_path.exists():
+        settings = json.loads(settings_path.read_text() or "{}")
+    hooks = settings.setdefault("hooks", {})
+    wanted = {
+        "SessionStart": "engram hook session-start",
+        "UserPromptSubmit": "engram hook user-prompt",
+        "Stop": "engram hook capture",
+    }
+    added = []
+    for event, command in wanted.items():
+        matchers = hooks.setdefault(event, [])
+        flat = json.dumps(matchers)
+        if command not in flat:
+            matchers.append({"hooks": [{"type": "command", "command": command}]})
+            added.append(event)
+    if not added:
+        click.echo("all engram hooks already installed.")
+        return
+    click.echo(f"will add hooks to {settings_path}: {', '.join(added)}")
+    if not yes and not click.confirm("proceed?"):
+        return
+    if settings_path.exists():
+        backup = settings_path.with_suffix(".json.engram-backup")
+        backup.write_text(settings_path.read_text())
+        click.echo(f"backed up existing settings to {backup}")
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    click.echo("installed. new sessions recall on start + every prompt, and "
+               "capture on stop.")
+
+
 @hook.command("print-config")
 def hook_print_config() -> None:
-    """The snippet to put in ~/.claude/settings.json."""
+    """The snippet to put in ~/.claude/settings.json (or use hook install)."""
     click.echo(json.dumps({
-        "hooks": {"SessionStart": [{"hooks": [
-            {"type": "command", "command": "engram hook session-start"}
-        ]}]}
+        "hooks": {
+            "SessionStart": [{"hooks": [
+                {"type": "command", "command": "engram hook session-start"}]}],
+            "UserPromptSubmit": [{"hooks": [
+                {"type": "command", "command": "engram hook user-prompt"}]}],
+            "Stop": [{"hooks": [
+                {"type": "command", "command": "engram hook capture"}]}],
+        }
     }, indent=2))
 
 

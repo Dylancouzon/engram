@@ -485,6 +485,8 @@ class MemoryStore:
                     emb, k=k * 3, flt=flt, prefetch_limit=self.config.prefetch_limit,
                     mmr_lambda=self.config.mmr_lambda,
                 )
+                for h in shard_hits:
+                    h.raw = h.score  # keep the absolute scale for thresholds
                 if len(shard_hits) >= 3:
                     # Enough hits for min-max to mean something.
                     lo = min(h.score for h in shard_hits)
@@ -511,7 +513,7 @@ class MemoryStore:
             w_rec, w_imp = self.config.weight_recency, self.config.weight_importance
             blend = (1 - w_rec - w_imp) + w_rec * recency + w_imp * m.importance
             rescored.append(RecallHit(memory=m, score=max(h.score, 0.0) * blend,
-                                      similarity=h.score))
+                                      similarity=h.raw))
         rescored.sort(key=lambda r: r.score, reverse=True)
         top = rescored[:k]
 
