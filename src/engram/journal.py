@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,             -- e.g. 'session-start-recall'
+    ts REAL NOT NULL,
+    hits INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -192,6 +198,26 @@ class Journal:
     def tombstones(self) -> set[str]:
         with self._lock:
             return {r[0] for r in self._conn.execute("SELECT memory_id FROM tombstones")}
+
+    # -- trigger measurement ---------------------------------------------------
+
+    def log_event(self, kind: str, hits: int = 0) -> None:
+        """Operational counters (proactive-trigger measurement), not memory
+        content: excluded from export, ignored by replay."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO events (kind, ts, hits) VALUES (?, ?, ?)",
+                (kind, time.time(), hits),
+            )
+
+    def event_summary(self) -> dict[str, dict[str, int]]:
+        """Per-kind: fired count + how often at least one memory surfaced —
+        the M1 recall-at-the-right-moment proxy."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT kind, COUNT(*), SUM(hits > 0) FROM events GROUP BY kind"
+            ).fetchall()
+        return {k: {"fired": c, "with_hits": h or 0} for k, c, h in rows}
 
     # -- export / replay -----------------------------------------------------
 

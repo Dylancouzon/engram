@@ -258,17 +258,27 @@ def import_(data_dir: str | None, source) -> None:
 @main.command()
 @click.argument("paths", nargs=-1, type=click.Path(exists=True, path_type=Path))
 @click.option("--scope", default="default")
+@click.option("--shard", default="private")
 @click.pass_obj
-def seed(data_dir: str | None, paths: tuple[Path, ...], scope: str) -> None:
-    """Seed memories from markdown files (CLAUDE.md, notes, ...). Each
+def seed(data_dir: str | None, paths: tuple[Path, ...], scope: str, shard: str) -> None:
+    """Seed memories from markdown files or directories (CLAUDE.md, notes,
+    an Obsidian vault, a folder of pasted ChatGPT/Claude memories). Each
     paragraph or bullet goes through the full write pipeline."""
     if not paths:
-        raise click.ClickException("give at least one file to seed from")
-    chunks: list[tuple[str, str]] = []
+        raise click.ClickException("give at least one file or directory to seed from")
+    files: list[Path] = []
     for path in paths:
-        for chunk in _split_markdown(path.read_text()):
+        if path.is_dir():
+            files.extend(sorted(p for p in path.rglob("*.md") if p.is_file()))
+        else:
+            files.append(path)
+    if not files:
+        raise click.ClickException("no markdown files found")
+    chunks: list[tuple[str, str]] = []
+    for path in files:
+        for chunk in _split_markdown(path.read_text(errors="replace")):
             chunks.append((chunk, str(path)))
-    click.echo(f"seeding {len(chunks)} chunks from {len(paths)} file(s)...")
+    click.echo(f"seeding {len(chunks)} chunks from {len(files)} file(s)...")
     counts: dict[Op, int] = {}
     with _open_store(data_dir) as store, click.progressbar(chunks, label="remembering") as bar:
         for text, ref in bar:
@@ -408,6 +418,48 @@ def clients_list(data_dir: str | None) -> None:
 
     for name, entry in ClientRegistry(_config(data_dir)).list().items():
         click.echo(f"{name:>16}: {', '.join(entry['scopes'])}")
+
+
+@main.group()
+def hook() -> None:
+    """Proactive recall triggers for assistant surfaces."""
+
+
+@hook.command("session-start")
+@click.option("--scope", default=None)
+@click.option("-k", type=int, default=5)
+@click.pass_obj
+def hook_session_start(data_dir: str | None, scope: str | None, k: int) -> None:
+    """Claude Code SessionStart hook: surface memories relevant to the
+    project being opened. Reads the hook payload on stdin, prints a context
+    block on stdout. Speculative recall: never reinforces."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        payload = {}
+    cwd = Path(payload.get("cwd") or Path.cwd())
+    query = f"project {cwd.name} preferences conventions decisions corrections"
+    with _open_surface(data_dir) as store:
+        hits = store.recall(query, k=k, scope=scope, reinforce=False)
+        journal = getattr(store, "journal", None)
+        if journal is not None:  # library mode; daemon logs server-side later
+            journal.log_event("session-start-recall", hits=len(hits))
+    if not hits:
+        return
+    click.echo(f"## Relevant long-term memories (engram, project {cwd.name})")
+    for h in hits:
+        click.echo(f"- {h.memory.text}")
+    click.echo("\n(Use the engram MCP tools to recall more or remember new facts.)")
+
+
+@hook.command("print-config")
+def hook_print_config() -> None:
+    """The snippet to put in ~/.claude/settings.json."""
+    click.echo(json.dumps({
+        "hooks": {"SessionStart": [{"hooks": [
+            {"type": "command", "command": "engram hook session-start"}
+        ]}]}
+    }, indent=2))
 
 
 @main.command()

@@ -728,8 +728,15 @@ class MemoryStore:
             "tombstones": len(self.journal.tombstones()),
             "data_dir": str(self.config.data_dir),
             "dense_model": DENSE_MODEL,
-            "extraction": "ollama" if self.llm.available() else "verbatim fallback",
+            "extraction": "ollama" if self.llm and self.llm.available()
+                          else "verbatim fallback",
         }
+        events = self.journal.event_summary()
+        if events:
+            info["triggers"] = {
+                kind: f"{v['with_hits']}/{v['fired']} surfaced memories"
+                for kind, v in events.items()
+            }
         return info
 
     def close(self) -> None:
