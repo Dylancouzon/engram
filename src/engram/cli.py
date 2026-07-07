@@ -267,8 +267,9 @@ def dashboard(data_dir: str | None, output: Path | None, open_browser: bool) -> 
         ]
         events = store.recent_events(200)
         info = store.stats()
+        points = store.map_points()
     path = output or Path(_config(data_dir).data_dir) / "dashboard.html"
-    path.write_text(render_dashboard(memories, events, info))
+    path.write_text(render_dashboard(memories, events, info, points))
     os.chmod(path, 0o600)  # it contains your memories in plain text
     click.echo(f"wrote {path} ({len(memories)} memories)")
     if open_browser:

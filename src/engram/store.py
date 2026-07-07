@@ -30,7 +30,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import TextIO
 
-from engram.backend.edge import EdgeBackend, build_filter
+from engram.backend.edge import EdgeBackend, Hit, build_filter
 from engram.config import DENSE_MODEL, Config
 from engram.embed import Embedder
 from engram.extract import ExtractedFact, extract
@@ -237,13 +237,22 @@ class MemoryStore:
                             path, dense_dim=self.config.dense_dim,
                         )
 
-    def shard_of(self, memory_id: str) -> str | None:
-        """Which shard holds this id (private wins if somehow duplicated)."""
+    def _locate(self, memory_id: str) -> tuple[str, Hit] | None:
+        """The shard holding this id and its current point, in one retrieve
+        (private wins if somehow duplicated). Callers that only need the
+        shard use shard_of; reinforce needs the point too, and fetching it
+        twice was pure waste on the post-recall path."""
         for shard in sorted(self.backends, key=lambda n: n != "private"):
             with self._shard_guard.shared():
-                if self.backends[shard].retrieve([memory_id]):
-                    return shard
+                found = self.backends[shard].retrieve([memory_id])
+            if found:
+                return shard, found[0]
         return None
+
+    def shard_of(self, memory_id: str) -> str | None:
+        """Which shard holds this id (private wins if somehow duplicated)."""
+        located = self._locate(memory_id)
+        return located[0] if located else None
 
     @property
     def _purge_marker(self) -> Path:
@@ -564,6 +573,52 @@ class MemoryStore:
         out = sorted(memories.values(), key=lambda m: m.created_at, reverse=True)
         return out[:limit] if limit else out
 
+    def map_points(self, neighbors: int = 3) -> list[dict]:
+        """A 2D projection of the memory space for the dashboard map, computed
+        here where the vectors live: the CLI/client receives only {id, x, y,
+        neighbors}, never raw vectors or payloads. PCA (numpy SVD) gives the
+        layout seed the browser force-settles; neighbors are top-cosine ids.
+
+        # ponytail: O(n^2) neighbor scan + full-matrix PCA. Fine for a
+        # personal store (thousands of points). If one ever reaches tens of
+        # thousands, sample for PCA and use an ANN query per point instead.
+        """
+        import numpy as np
+
+        ids: list[str] = []
+        vecs: list[list[float]] = []
+        with self._shard_guard.shared():
+            for name in sorted(self.backends, key=lambda n: n != "private"):
+                for pid, vector, _payload in self.backends[name].export_raw():
+                    dense = vector.get("dense") if isinstance(vector, dict) else vector
+                    if dense is not None:
+                        ids.append(pid)
+                        vecs.append(list(dense))
+        if not ids:
+            return []
+
+        X = np.asarray(vecs, dtype=np.float64)
+        centered = X - X.mean(axis=0)
+        if len(ids) >= 2:
+            _, _, vt = np.linalg.svd(centered, full_matrices=False)
+            coords = centered @ vt[:2].T
+        else:
+            coords = np.zeros((len(ids), 2))
+
+        # Cosine neighbors (on-disk vectors aren't guaranteed unit-norm).
+        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        unit = X / np.where(norms == 0, 1.0, norms)
+        sim = unit @ unit.T
+        np.fill_diagonal(sim, -np.inf)
+        k = min(neighbors, len(ids) - 1)
+        nbr = np.argsort(-sim, axis=1)[:, :k] if k > 0 else np.empty((len(ids), 0), int)
+
+        return [
+            {"id": pid, "x": float(coords[i, 0]), "y": float(coords[i, 1]),
+             "neighbors": [ids[j] for j in nbr[i]]}
+            for i, pid in enumerate(ids)
+        ]
+
     def _reinforce(self, memory_ids: list[str]) -> None:
         if self._reinforce_mode == "buffered":
             with self._reinforce_queue_lock:
@@ -591,17 +646,14 @@ class MemoryStore:
         grow the source of truth for a store meant to last years."""
         now = now_ts()
         for mid, n in bumps.items():
-            shard = self.shard_of(mid)
-            if shard is None:
+            located = self._locate(mid)
+            if located is None:
                 continue
-            backend = self._backend(shard)
-            hit = backend.retrieve([mid])
-            if not hit:
-                continue
-            count = int(hit[0].payload.get("access_count") or 0) + n
+            shard, hit = located
+            count = int(hit.payload.get("access_count") or 0) + n
             partial = {"access_count": count, "last_accessed": now}
             seq = self.journal.reinforce(mid, partial, shard=shard)
-            backend.set_payload(mid, partial)
+            self._backend(shard).set_payload(mid, partial)
             self._applied_seq = max(self._applied_seq, seq)
 
     # -- forget ------------------------------------------------------------------

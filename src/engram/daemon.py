@@ -294,6 +294,10 @@ class Daemon:
         _check_scope(scopes, "*")  # shard names/counts are owner information
         return self.store.stats()
 
+    def _m_map_points(self, params: dict, scopes: list[str], client: str) -> dict:
+        _check_scope(scopes, "*")  # a projection over every memory is owner-wide
+        return {"points": self.store.map_points(int(params.get("neighbors", 3)))}
+
     def _m_reviews(self, params: dict, scopes: list[str], client: str) -> dict:
         from engram.protocol import review_to_wire
 

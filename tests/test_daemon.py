@@ -153,6 +153,28 @@ def test_export_requires_full_access(config, daemon):
         assert "exportable fact" in c.export_jsonl()
 
 
+def test_map_points_travels_the_wire(config, daemon):
+    """The dashboard map must work in daemon mode (the common case): the
+    projection is computed store-side and only coords + neighbor ids cross
+    the socket."""
+    with _client(config, "cli") as c:
+        c.remember("rust code fast safe", scope="work")
+        c.remember("rust code memory build", scope="work")
+        points = c.map_points(neighbors=1)
+        assert len(points) == 2
+        p = points[0]
+        assert set(p) == {"id", "x", "y", "neighbors"}
+        assert isinstance(p["x"], float) and p["neighbors"]
+
+
+def test_map_points_requires_full_access(config, daemon):
+    ClientRegistry(config).allow("narrow", ["work"])
+    with _client(config, "narrow") as c:
+        with pytest.raises(ProtocolError) as exc:
+            c.map_points()
+        assert exc.value.code == "scope_denied"
+
+
 def test_no_daemon_raises_cleanly(config):
     with pytest.raises(DaemonUnavailable):
         Client(config, client_name="cli").connect(spawn=False)

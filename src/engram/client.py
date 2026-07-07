@@ -183,6 +183,9 @@ class Client:
     def stats(self) -> dict:
         return dict(self.call("stats"))
 
+    def map_points(self, neighbors: int = 3) -> list[dict]:
+        return list(self.call("map_points", neighbors=neighbors)["points"])
+
     def pending_reviews(self) -> list:
         from engram.protocol import review_from_wire
 
