@@ -43,7 +43,10 @@ known: corrections supersede the stale fact, refinements update it,
 duplicates reinforce it, and anything the local judge is unsure about is
 kept safe and queued for your call (`engram review`). A small local model
 (Qwen3 via [Ollama](https://ollama.com)) makes those calls; without it,
-engram still works and stores verbatim.
+engram still works and stores verbatim. On a 25-case golden set graded
+against the real local models, the write model picks the right operation 84%
+of the time and surfaces the right memory on every recall (100%); the harness
+lives in `golden/`, so you can check the number yourself.
 
 Recall is retrieval, not keyword grep: hybrid dense + sparse search
 ([nomic-embed](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) +
@@ -53,6 +56,37 @@ payload pre-filtering by scope and temporal validity, decayed by recency,
 weighted by importance. The engine is [Qdrant Edge](https://qdrant.tech/edge/),
 the in-process build of the Qdrant vector search engine: server-class
 retrieval running inside the process, like SQLite.
+
+## Working With Coding Agents
+
+The three verbs are the manual path. With Claude Code, engram runs inside the
+assistant's normal loop, wired in by one command:
+
+```bash
+engram hook install claude-code   # installs the hooks, offers to run the daemon
+```
+
+After that, every session:
+
+- **Recalls on every prompt.** Before the model answers, engram searches your
+  memory against what you just typed and injects the confident matches. The
+  model never has to decide to look: the relevant correction or preference is
+  already in context.
+- **Loads project context at the start.** Opening a project surfaces the
+  decisions, conventions, and corrections tied to it.
+- **Saves when the session ends.** On stop (or when a long session compacts),
+  engram harvests the durable facts from what you said and runs them through
+  the write pipeline: redaction, extraction, dedup, conflict resolution.
+  Filler is dropped; a correction supersedes the stale fact.
+
+Recall is gated on similarity, so an unrelated prompt injects nothing. Saving
+needs the local model to tell a fact from filler; without it, capture is a
+no-op and you write with `remember` yourself.
+
+Hooks are the floor: recall-at-the-right-moment that doesn't depend on the
+model choosing to act. The MCP tools below are the supplement, for the model
+to recall or remember mid-conversation. Editors without hook support (Cursor,
+Windsurf) get a paste-in rules block instead: `engram rules cursor`.
 
 ## Plug It Into Your Assistants
 
@@ -76,12 +110,7 @@ The assistant gets three tools: `remember`, `recall`, and `forget`. A
 correction made in one app supersedes the stale fact everywhere, because
 there is only one memory. Apps granted `--scopes work` never see `personal`
 memories; add `--token --methods remember` for least-privilege ingestion
-adapters (see `docs/ingestion.md`). Claude Code can also surface relevant
-memories at session start:
-
-```bash
-engram hook print-config   # paste into ~/.claude/settings.json
-```
+adapters (see `docs/ingestion.md`).
 
 ## Trust Boundaries and Sync
 
@@ -92,11 +121,13 @@ Memories live in shards that set their blast radius:
 - **`me-synced`**: your own memories, across your devices.
 - **`shared:<group>`**: opt-in pools (family, team).
 
-Sync uses a standard Qdrant Cloud collection as a dumb relay: memories
-travel as ciphertext (encrypted with a key that never leaves your devices),
-with no embeddings and no plaintext uploaded. Devices merge locally:
-last-write-wins by timestamp, and a hard forget propagates as a
-content-free tombstone that purges the memory everywhere.
+Sync uses a standard Qdrant Cloud collection as a dumb relay: each memory's
+text and embeddings travel as ciphertext, encrypted with a key that never
+leaves your devices. The relay never sees content or vectors; it does see
+routing metadata (memory ids, timestamps, device names), which is what lets
+devices merge. Merge happens locally: last-write-wins by timestamp, and a
+hard forget propagates as a content-free tombstone that purges the memory
+everywhere.
 
 ```bash
 engram sync setup --shard me-synced --url https://<cluster>.qdrant.io --api-key ...
@@ -127,8 +158,10 @@ engram sync now
 
 ## Install
 
-Requires Python 3.12 on macOS (Apple Silicon), Linux x86_64/aarch64, or
-Windows. From source for now:
+Requires Python 3.12 on macOS (Apple Silicon) or Linux (x86_64/aarch64). The
+background daemon installs at login via launchd on macOS; on Linux, run
+`engram daemon` yourself (or wrap it in a systemd user unit). From source for
+now:
 
 ```bash
 git clone https://github.com/qdrant/engram && cd engram

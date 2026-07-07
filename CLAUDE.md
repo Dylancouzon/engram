@@ -13,10 +13,18 @@ not break, and the traps already discovered. Full original spec:
 
 ## Status: M0–M3 complete
 
-All four milestones built, reviewed (three Codex adversarial passes, all
-findings fixed), and validated with real models. **94 tests green**, ruff
-clean. Golden set: **84% op accuracy, 100% recall accuracy** (misses are all
-conservative degrade-to-ADD — the safe direction). ~4400 LOC source.
+All four milestones built, reviewed (Codex + andrey-review adversarial passes,
+all findings fixed), and validated with real models. **102 tests green**, ruff
+clean. Golden set: **84% op accuracy, 100% recall accuracy** (misses are the
+safe direction: mostly degrade-to-ADD, plus a couple NOOP→UPDATE — never a
+wrongful supersede or a lost recall). ~4500 LOC source.
+
+A reliability/dogfood pass hardened four things (all reviewed, tests added):
+reads no longer grow the source of truth (`journal.reinforce` collapses to
+one row per memory); a fabrication guard degrades ungrounded LLM output to
+verbatim; the sync LWW clock counts only content ops (a local read/dedup can
+no longer shadow a remote edit); `engram hook install` offers the daemon so
+the proactive-recall path isn't slow by default.
 
 Not built (deliberate cuts, not omissions): Wave-C/D ingestion adapters
 (email/messages/voice/CLIP) — the adapter *contract* is documented in
@@ -113,9 +121,12 @@ Everything else is a consequence of protecting that invariant.
   (documented; real defense is the token).
 - Reads are lock-free; writes serialize through `store._write_lock`.
   Reinforcement (access bumps) is **buffered** in the daemon and drained on
-  idle/close, so reads never write. `_ShardGuard` is a readers-writer lock on
-  the shard *lifetime* (not its data): recall takes shared, anything that
-  closes/replaces a shard object (purge, rebuild, close) takes exclusive.
+  idle/close, so reads never write; and each bump **collapses** to one journal
+  row per memory (`journal.reinforce`), so read volume never grows the source
+  of truth — load-bearing for a store meant to last years. `_ShardGuard` is a
+  readers-writer lock on the shard *lifetime* (not its data): recall takes
+  shared, anything that closes/replaces a shard object (purge, rebuild, close)
+  takes exclusive.
 
 **Proactive recall — the adoption bet (M1, expanded after research).**
 - MCP is pull-only; the field-wide finding (see research below) is that
@@ -252,6 +263,21 @@ model downloads; sync tests use `QdrantClient(":memory:")` as the relay.
 - **Small models are loose about JSON envelopes** — `extract.py` accepts
   `{"memories":[...]}`, a bare list, or a single bare object before falling
   back to verbatim.
+- **Small models fabricate on contentless input** — "test fact" once yielded
+  an invented "I decided to learn Python". `extract.py` guards this: if the
+  WHOLE extraction shares no content token with the input, degrade to verbatim.
+  Grounding is checked across the whole extraction, NEVER per-fact (a per-fact
+  drop would bury a legit rephrased fact in a sibling's `source_text`).
+- **The sync LWW clock (`journal.last_ts_for`) must count only content ops**
+  (`upsert`/`delete`/`sync-pull`), never `reinforce`/`noop`/`review`. Those
+  audit/read rows carry fresh timestamps but change nothing; counting them let
+  a local recall or dedup shadow a genuine older-but-real remote edit and drop
+  it on pull. Found by andrey-review + Codex.
+- **Reinforcement must not grow the journal** — `journal.reinforce` collapses
+  to one row per memory (delete + reinsert at a fresh seq). Relies on `seq`
+  being AUTOINCREMENT (no reuse) so the replacement stays above what it
+  replaced; don't drop AUTOINCREMENT. `stats` reports `row_count`, not
+  `last_seq` (which keeps climbing past deleted rows).
 - **Test secret fixtures** must be runtime-assembled from fragments, or
   GitGuardian flags them (it did, on commit ff5790d — those are false
   positives; assembly since 71fd366).
