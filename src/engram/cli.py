@@ -630,9 +630,8 @@ def hook_capture(data_dir: str | None, scope: str, max_chars: int) -> None:
         return
     with _open_surface(data_dir) as store:
         llm = getattr(store, "llm", None)
-        if llm is None or not llm.available():
-            if isinstance(store, MemoryStore):
-                return  # library mode without a model: skip, never store blobs
+        if (llm is None or not llm.available()) and isinstance(store, MemoryStore):
+            return  # library mode without a model: skip, never store blobs
         actions = store.remember(tail, scope=scope, surface="auto-capture",
                                  source_ref=str(transcript_path))
         journal = getattr(store, "journal", None)
@@ -643,7 +642,8 @@ def hook_capture(data_dir: str | None, scope: str, max_chars: int) -> None:
 @hook.command("install")
 @click.argument("surface", type=click.Choice(["claude-code"]))
 @click.option("--yes", is_flag=True, help="Skip confirmation.")
-def hook_install(surface: str, yes: bool) -> None:
+@click.pass_obj
+def hook_install(data_dir: str | None, surface: str, yes: bool) -> None:
     """Wire the hooks into ~/.claude/settings.json (backs it up first)."""
     settings_path = Path.home() / ".claude" / "settings.json"
     settings = {}
@@ -667,6 +667,7 @@ def hook_install(surface: str, yes: bool) -> None:
             added.append(event)
     if not added:
         click.echo("all engram hooks already installed.")
+        _offer_daemon(data_dir, yes)  # hooks may be set but the daemon may not
         return
     click.echo(f"will add hooks to {settings_path}: {', '.join(added)}")
     if not yes and not click.confirm("proceed?"):
@@ -679,6 +680,36 @@ def hook_install(surface: str, yes: bool) -> None:
     settings_path.write_text(json.dumps(settings, indent=2) + "\n")
     click.echo("installed. new sessions recall on start + every prompt, and "
                "capture on stop.")
+    _offer_daemon(data_dir, yes)
+
+
+def _offer_daemon(data_dir: str | None, yes: bool) -> None:
+    """Hooks fire on every prompt; without the daemon they fall back to
+    library mode, reloading the embedding model each time (slow, and the very
+    first run downloads it inside the hook). Offer to keep a warm daemon."""
+    cfg = _config(data_dir)
+    client = Client(cfg, client_name="cli")
+    try:
+        client.connect(spawn=False)
+        try:
+            healthy = client.ping()  # a live socket may not be a healthy daemon
+        finally:
+            client.close()
+        if healthy:
+            return  # daemon already serving; recall is warm
+    except (DaemonUnavailable, OSError):
+        pass
+    if sys.platform != "darwin":
+        click.echo("\nfor fast recall, keep the daemon running: `engram daemon`"
+                   " (or a systemd user unit).")
+        return
+    click.echo("\nHooks recall on every prompt. Without a background daemon each"
+               " one reloads the model (slow; the first also downloads it).")
+    if not yes and not click.confirm("install the daemon to start at login?",
+                                     default=True):
+        click.echo("skipped. start it later with: engram daemon --install")
+        return
+    _install_launchd(cfg)
 
 
 @hook.command("print-config")
