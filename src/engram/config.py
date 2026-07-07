@@ -49,6 +49,11 @@ class Config:
     half_life_days: dict[str, float] = field(
         default_factory=lambda: {"semantic": 180.0, "episodic": 14.0, "procedural": 365.0}
     )
+    # MMR diversification of recall results (None disables). Server-side
+    # decay via FormulaQuery is impossible on Edge 0.7.2 (probed: Formula
+    # never sees the fused score), hence the app-side rescore below.
+    mmr_lambda: float | None = 0.7
+
     # Blend weights for the app-side rescore:
     # score = similarity * (base + w_rec*recency + w_imp*importance)
     weight_recency: float = 0.25
@@ -66,8 +71,17 @@ class Config:
         return self.data_dir / "journal.db"
 
     @property
+    def shards_root(self) -> Path:
+        return self.data_dir / "shards"
+
+    def shard_path(self, shard: str) -> Path:
+        # "shared:family" -> shards/shared__family (':' is awkward on disk)
+        return self.shards_root / shard.replace(":", "__")
+
+    @property
     def shard_dir(self) -> Path:
-        return self.data_dir / "shards" / "private"
+        """The default (private) shard — kept for M0-era callers."""
+        return self.shard_path("private")
 
     @property
     def models_dir(self) -> Path:

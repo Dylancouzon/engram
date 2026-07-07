@@ -40,6 +40,18 @@ from engram.models import Memory, MemoryType, Op, RecallHit, new_memory_id, now_
 from engram.redact import redact
 from engram.resolve import Verdict, judge
 
+_SHARD_NAME = re.compile(r"^(private|me-synced|shared:[a-z0-9_-]{1,32})$")
+
+
+def validate_shard(shard: str) -> str:
+    """Trust-boundary shard names are a closed grammar, not free text:
+    private (never syncs, default) | me-synced | shared:<group>."""
+    if not _SHARD_NAME.match(shard):
+        raise ValueError(
+            f"invalid shard {shard!r}: use private, me-synced, or shared:<group>"
+        )
+    return shard
+
 
 def _normalize(text: str) -> str:
     """Case/punctuation/whitespace-insensitive form for verbatim-dedup."""
@@ -166,12 +178,13 @@ class MemoryStore:
             self.llm = (
                 LocalLLM(cfg.ollama_url, cfg.extraction_model) if llm == "auto" else llm
             )
+            self.backends: dict[str, EdgeBackend] = {}
             if self._purge_marker.exists():
                 # A hard-forget purge (or its recovery) was interrupted. The
                 # journal is already clean, so rebuild the index from it.
                 self._recover_interrupted_purge()
             else:
-                self.backend = EdgeBackend(cfg.shard_dir, dense_dim=cfg.dense_dim)
+                self._open_existing_shards()
             # Highest journal seq actually applied to Edge in this session.
             # The high-water mark may only ever advance to this — never to
             # last_seq blindly, or a write that crashed between journal-append
@@ -184,19 +197,51 @@ class MemoryStore:
             raise
 
     @property
+    def backend(self) -> EdgeBackend:
+        """The private shard — the default write target and M0-era surface."""
+        return self._backend("private")
+
+    def _backend(self, shard: str) -> EdgeBackend:
+        validate_shard(shard)
+        if shard not in self.backends:
+            self.backends[shard] = EdgeBackend(
+                self.config.shard_path(shard), dense_dim=self.config.dense_dim
+            )
+        return self.backends[shard]
+
+    def _open_existing_shards(self) -> None:
+        """Open every shard already on disk (recall fans out across them),
+        and always the private one (it's the default write target)."""
+        self._backend("private")
+        if self.config.shards_root.exists():
+            for path in self.config.shards_root.iterdir():
+                if path.is_dir() and not path.name.endswith(".purging"):
+                    name = path.name.replace("__", ":")
+                    if name not in self.backends and _SHARD_NAME.match(name):
+                        self.backends[name] = EdgeBackend(
+                            path, dense_dim=self.config.dense_dim
+                        )
+
+    def shard_of(self, memory_id: str) -> str | None:
+        """Which shard holds this id (private wins if somehow duplicated)."""
+        for shard in sorted(self.backends, key=lambda n: n != "private"):
+            with self._shard_guard.shared():
+                if self.backends[shard].retrieve([memory_id]):
+                    return shard
+        return None
+
+    @property
     def _purge_marker(self) -> Path:
         return self.config.data_dir / "purge.pending"
 
     def _recover_interrupted_purge(self) -> None:
         import shutil
 
-        shard_dir = self.config.shard_dir
-        stale = shard_dir.with_name(shard_dir.name + ".purging")
-        for path in (shard_dir, stale):
-            if path.exists():
-                shutil.rmtree(path)
-        self.backend = EdgeBackend(shard_dir, dense_dim=self.config.dense_dim)
-        self.rebuild(wipe=False)  # the shard was just wiped and recreated
+        if self.config.shards_root.exists():
+            shutil.rmtree(self.config.shards_root)
+        self.backends = {}
+        self._backend("private")
+        self.rebuild(wipe=False)  # shards were just wiped
         self._purge_marker.unlink()
 
     # -- write ---------------------------------------------------------------
@@ -210,7 +255,9 @@ class MemoryStore:
         importance: float | None = None,
         surface: str = "cli",
         source_ref: str | None = None,
+        shard: str = "private",
     ) -> list[WriteAction]:
+        validate_shard(shard)
         scrubbed = redact(text, enabled=self.config.redaction_enabled)
         if scrubbed.refused:
             raise WriteRefusedError(scrubbed.refusal_reason or "refused by redaction")
@@ -238,19 +285,23 @@ class MemoryStore:
                 if tags:
                     fact.tags = list(dict.fromkeys(fact.tags + [t.lower() for t in tags]))
 
-                verdict = self._resolve_conflict(fact, scope)
-                action = self._apply(fact, verdict, source_text, scope, surface, source_ref)
+                verdict = self._resolve_conflict(fact, scope, shard)
+                action = self._apply(fact, verdict, source_text, scope, surface,
+                                     source_ref, shard)
                 action.redaction_hits = scrubbed.hits
                 actions.append(action)
             return actions
 
-    def _resolve_conflict(self, fact: ExtractedFact, scope: str) -> Verdict:
-        # Candidates come from a dense-only search: unlike fused scores,
-        # cosine similarity is a stable, interpretable gate.
-        if self.backend.count() == 0:
+    def _resolve_conflict(self, fact: ExtractedFact, scope: str, shard: str) -> Verdict:
+        # Candidates come from a dense-only search within the target shard:
+        # unlike fused scores, cosine similarity is a stable gate, and a
+        # private fact must never be judged against (or leak into) a synced
+        # shard's contents.
+        backend = self._backend(shard)
+        if backend.count() == 0:
             return Verdict(op=Op.ADD, target=None, confidence=1.0)
         query = self.embedder.embed_query(fact.text)
-        hits = self.backend.query_dense(
+        hits = backend.query_dense(
             query.dense,
             k=self.config.conflict_top_k,
             flt=build_filter(scope=scope, valid_at=now_ts()),
@@ -285,6 +336,7 @@ class MemoryStore:
         scope: str,
         surface: str,
         source_ref: str | None,
+        shard: str = "private",
     ) -> WriteAction:
         confident = verdict.confidence >= self.config.judge_confidence
         # A NOOP the judge is lukewarm on still stands when the retrieval
@@ -323,7 +375,7 @@ class MemoryStore:
             updated.importance = max(updated.importance, fact.importance)
             updated.tags = list(dict.fromkeys(updated.tags + fact.tags))
             updated.embedding_model = DENSE_MODEL
-            self._commit_upserts([updated])
+            self._commit_upserts([updated], shard)
             return WriteAction(op=Op.UPDATE, memory=updated, target=verdict.target,
                                confidence=verdict.confidence)
 
@@ -348,11 +400,11 @@ class MemoryStore:
             old.superseded_by = new.id
             # One journal transaction: the correction and the invalidation
             # land together or not at all.
-            self._commit_upserts([old, new])
+            self._commit_upserts([old, new], shard)
             return WriteAction(op=Op.SUPERSEDE, memory=new, target=old,
                                confidence=verdict.confidence)
 
-        self._commit_upserts([new])
+        self._commit_upserts([new], shard)
 
         # Ambiguous UPDATE/SUPERSEDE: the ADD above is the safe floor, and
         # the judged op is queued for the owner to accept or reject.
@@ -372,13 +424,15 @@ class MemoryStore:
                     "confidence": verdict.confidence,
                     "merged_text": verdict.merged_text,
                 },
+                shard=shard,
             )
             self._applied_seq = max(self._applied_seq, seq)
             self.journal.mark_flushed(seq)  # no Edge effect; durable at append
         return WriteAction(op=Op.ADD, memory=new, confidence=verdict.confidence,
                            queued_review=queue)
 
-    def _commit_upserts(self, memories: list[Memory]) -> None:
+    def _commit_upserts(self, memories: list[Memory], shard: str = "private") -> None:
+        backend = self._backend(shard)
         intents = []
         for m in memories:
             payload = m.to_payload()
@@ -386,13 +440,13 @@ class MemoryStore:
                 json.dumps(["upsert", m.id, payload], sort_keys=True).encode()
             ).hexdigest()
             intents.append(("upsert", m.id, payload, key))
-        last_seq = self.journal.append_many(intents)[-1]  # <- the ack point
+        last_seq = self.journal.append_many(intents, shard=shard)[-1]  # <- the ack point
 
         embedded = self.embedder.embed_documents([m.text for m in memories])
         for m, emb in zip(memories, embedded, strict=True):
-            self.backend.upsert(m, emb)
+            backend.upsert(m, emb)
         self._applied_seq = max(self._applied_seq, last_seq)
-        self.backend.flush()
+        backend.flush()
         self.journal.mark_flushed(self._applied_seq)
 
     # -- read ------------------------------------------------------------------
@@ -406,6 +460,7 @@ class MemoryStore:
         tags: list[str] | None = None,
         as_of: float | None = None,
         reinforce: bool = True,
+        shard: str | None = None,
     ) -> list[RecallHit]:
         k = k or self.config.recall_k
         emb = self.embedder.embed_query(query)
@@ -415,11 +470,27 @@ class MemoryStore:
             tags=tags,
             valid_at=as_of if as_of is not None else now_ts(),
         )
-        # Over-fetch so the rescore has real headroom to reorder.
+        # Fan out across shards (Edge fuses only within one). Per-shard
+        # scores are min-max normalized before merging, ids dedup with
+        # private winning ties, and the rescore has over-fetch headroom.
+        shards = [shard] if shard else sorted(
+            self.backends, key=lambda n: n != "private"
+        )
+        hits = []
         with self._shard_guard.shared():
-            hits = self.backend.query_hybrid(
-                emb, k=k * 3, flt=flt, prefetch_limit=self.config.prefetch_limit
-            )
+            for name in shards:
+                shard_hits = self._backend(name).query_hybrid(
+                    emb, k=k * 3, flt=flt, prefetch_limit=self.config.prefetch_limit,
+                    mmr_lambda=self.config.mmr_lambda,
+                )
+                if shard_hits:
+                    lo = min(h.score for h in shard_hits)
+                    hi = max(h.score for h in shard_hits)
+                    span = (hi - lo) or 1.0
+                    for h in shard_hits:
+                        h.score = 0.5 if hi == lo else (h.score - lo) / span
+                seen_ids = {h.id for h in hits}
+                hits.extend(h for h in shard_hits if h.id not in seen_ids)
 
         now = now_ts()
         rescored: list[RecallHit] = []
@@ -440,10 +511,13 @@ class MemoryStore:
         return top
 
     def get(self, memory_id: str) -> Memory | None:
-        """Fetch one memory by id (shard-guarded; daemon read path)."""
+        """Fetch one memory by id from whichever shard holds it."""
         with self._shard_guard.shared():
-            found = self.backend.retrieve([memory_id])
-        return found[0].memory() if found else None
+            for name in sorted(self.backends, key=lambda n: n != "private"):
+                found = self.backends[name].retrieve([memory_id])
+                if found:
+                    return found[0].memory()
+        return None
 
     def _reinforce(self, memory_ids: list[str]) -> None:
         if self._reinforce_mode == "buffered":
@@ -470,13 +544,17 @@ class MemoryStore:
         Replay is idempotent (absolute counts), so a crash loses nothing."""
         now = now_ts()
         for mid, n in bumps.items():
-            hit = self.backend.retrieve([mid])
+            shard = self.shard_of(mid)
+            if shard is None:
+                continue
+            backend = self._backend(shard)
+            hit = backend.retrieve([mid])
             if not hit:
                 continue
             count = int(hit[0].payload.get("access_count") or 0) + n
             partial = {"access_count": count, "last_accessed": now}
-            seq = self.journal.append("reinforce", mid, partial)
-            self.backend.set_payload(mid, partial)
+            seq = self.journal.append("reinforce", mid, partial, shard=shard)
+            backend.set_payload(mid, partial)
             self._applied_seq = max(self._applied_seq, seq)
 
     # -- forget ------------------------------------------------------------------
@@ -488,7 +566,11 @@ class MemoryStore:
             return self._forget_locked(memory_id, mode)
 
     def _forget_locked(self, memory_id: str, mode: str) -> Memory | None:
-        found = self.backend.retrieve([memory_id])
+        owner_shard = self.shard_of(memory_id)
+        if owner_shard is None:
+            return None
+        backend = self._backend(owner_shard)
+        found = backend.retrieve([memory_id])
         memory = found[0].memory() if found else None
 
         if mode == "soft":
@@ -496,10 +578,10 @@ class MemoryStore:
                 return None
             memory.valid_to = now_ts()
             payload = memory.to_payload()
-            seq = self.journal.append("upsert", memory.id, payload)
-            self.backend.set_payload(memory.id, {"valid_to": memory.valid_to})
+            seq = self.journal.append("upsert", memory.id, payload, shard=owner_shard)
+            backend.set_payload(memory.id, {"valid_to": memory.valid_to})
             self._applied_seq = max(self._applied_seq, seq)
-            self.backend.flush()
+            backend.flush()
             self.journal.mark_flushed(self._applied_seq)
             return memory
 
@@ -515,24 +597,26 @@ class MemoryStore:
         #                           (vectors preserved, no re-embed)
         self._purge_marker.touch()
         self.journal.hard_forget(memory_id)
-        self._purge_shard(exclude={memory_id})
+        self._purge_shard(exclude={memory_id}, shard=owner_shard)
         self._purge_marker.unlink()
         return memory
 
-    def _purge_shard(self, exclude: set[str]) -> None:
+    def _purge_shard(self, exclude: set[str], shard: str = "private") -> None:
         import shutil
 
-        survivors = self.backend.export_raw(exclude=exclude)
+        backend = self._backend(shard)
+        survivors = backend.export_raw(exclude=exclude)
         with self._shard_guard.exclusive():
-            self.backend.close()
-            shard_dir = self.config.shard_dir
+            backend.close()
+            shard_dir = self.config.shard_path(shard)
             trash = shard_dir.with_name(shard_dir.name + ".purging")
             shard_dir.rename(trash)
-            self.backend = EdgeBackend(shard_dir, dense_dim=self.config.dense_dim)
+            new_backend = EdgeBackend(shard_dir, dense_dim=self.config.dense_dim)
+            self.backends[shard] = new_backend
             for point_id, vector, payload in survivors:
-                self.backend.upsert_raw(point_id, vector, payload)
+                new_backend.upsert_raw(point_id, vector, payload)
             self._applied_seq = self.journal.last_seq
-            self.backend.flush()
+            new_backend.flush()
             self.journal.mark_flushed(self._applied_seq)
         shutil.rmtree(trash)
 
@@ -617,11 +701,11 @@ class MemoryStore:
             import shutil
 
             with self._shard_guard.exclusive():
-                self.backend.close()
-                shutil.rmtree(self.config.shard_dir)
-                self.backend = EdgeBackend(
-                    self.config.shard_dir, dense_dim=self.config.dense_dim
-                )
+                for backend in self.backends.values():
+                    backend.close()
+                shutil.rmtree(self.config.shards_root)
+                self.backends = {}
+                self._backend("private")
         applied = 0
         tombstoned = self.journal.tombstones()
         for entry in self.journal.entries():
@@ -630,13 +714,15 @@ class MemoryStore:
             self._apply_entry(entry)
             applied += 1
         self._applied_seq = self.journal.last_seq
-        self.backend.flush()
+        for backend in self.backends.values():
+            backend.flush()
         self.journal.mark_flushed(self._applied_seq)
         return applied
 
     def stats(self) -> dict:
         info: dict = {
-            "points": self.backend.count(),
+            "points": sum(b.count() for b in self.backends.values()),
+            "shards": {name: b.count() for name, b in sorted(self.backends.items())},
             "journal_entries": self.journal.last_seq,
             "flushed_seq": self.journal.flushed_seq,
             "tombstones": len(self.journal.tombstones()),
@@ -650,9 +736,11 @@ class MemoryStore:
         try:
             self.flush_reinforce()
             with self._write_lock, self._shard_guard.exclusive():
-                self.backend.flush()
+                for backend in self.backends.values():
+                    backend.flush()
                 self.journal.mark_flushed(self._applied_seq)
-                self.backend.close()
+                for backend in self.backends.values():
+                    backend.close()
                 self.journal.close()
         finally:
             fcntl.flock(self._lock_file, fcntl.LOCK_UN)
@@ -681,17 +769,19 @@ class MemoryStore:
                 continue
             self._apply_entry(entry)
         self._applied_seq = self.journal.last_seq
-        self.backend.flush()
+        for backend in self.backends.values():
+            backend.flush()
         self.journal.mark_flushed(self._applied_seq)
 
     def _apply_entry(self, entry: JournalEntry) -> None:
+        backend = self._backend(entry.shard)
         if entry.op == "upsert" and entry.payload is not None:
             memory = Memory.from_payload(entry.memory_id, entry.payload)
             emb = self.embedder.embed_documents([memory.text])[0]
-            self.backend.upsert(memory, emb)
+            backend.upsert(memory, emb)
         elif entry.op == "delete":
-            self.backend.delete([entry.memory_id])
+            backend.delete([entry.memory_id])
         elif entry.op == "reinforce" and entry.payload is not None:
             # Only meaningful if the point exists (skip bumps for later-forgotten ids).
-            if self.backend.retrieve([entry.memory_id]):
-                self.backend.set_payload(entry.memory_id, entry.payload)
+            if backend.retrieve([entry.memory_id]):
+                backend.set_payload(entry.memory_id, entry.payload)

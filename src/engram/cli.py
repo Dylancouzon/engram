@@ -101,9 +101,12 @@ def main(ctx: click.Context, data_dir: str | None) -> None:
 @click.option("--scope", default="default", help="Payload scope (work, personal, ...).")
 @click.option("--importance", type=click.FloatRange(0.0, 1.0), default=None)
 @click.option("--source-ref", default=None, help="Provenance pointer (file, url, chat).")
+@click.option("--shard", default="private",
+              help="Trust boundary: private (default, never syncs), me-synced, shared:<group>.")
 @click.pass_obj
 def remember(data_dir: str | None, text: str, mtype: str | None, tags: str | None,
-             scope: str, importance: float | None, source_ref: str | None) -> None:
+             scope: str, importance: float | None, source_ref: str | None,
+             shard: str) -> None:
     """Store something worth keeping. Conflicts with existing memories are
     resolved on write: corrections supersede, refinements update."""
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
@@ -116,6 +119,7 @@ def remember(data_dir: str | None, text: str, mtype: str | None, tags: str | Non
                 scope=scope,
                 importance=importance,
                 source_ref=source_ref,
+                shard=shard,
             )
         except WriteRefusedError as e:
             raise click.ClickException(f"not stored: {e}") from e
@@ -149,17 +153,18 @@ def remember(data_dir: str | None, text: str, mtype: str | None, tags: str | Non
 @click.option("--scope", default=None)
 @click.option("--type", "mtype", type=click.Choice([t.value for t in MemoryType]), default=None)
 @click.option("--tags", default=None, help="Comma-separated tag filter (any match).")
+@click.option("--shard", default=None, help="Search one trust boundary only.")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @click.pass_obj
 def recall(data_dir: str | None, query: str, k: int | None, scope: str | None,
-           mtype: str | None, tags: str | None, as_json: bool) -> None:
+           mtype: str | None, tags: str | None, shard: str | None, as_json: bool) -> None:
     """Surface the memories relevant to a query (hybrid search, decayed by
     recency, weighted by importance)."""
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
     with _open_surface(data_dir) as store:
         hits = store.recall(
             query, k=k, scope=scope,
-            type=MemoryType(mtype) if mtype else None, tags=tag_list,
+            type=MemoryType(mtype) if mtype else None, tags=tag_list, shard=shard,
         )
     if as_json:
         click.echo(json.dumps(

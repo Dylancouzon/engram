@@ -27,6 +27,7 @@ from qdrant_edge import (
     Fusion,
     MatchAny,
     MatchValue,
+    Mmr,
     Modifier,
     PayloadSchemaType,
     Point,
@@ -185,9 +186,11 @@ class EdgeBackend:
         k: int,
         flt: Filter | None = None,
         prefetch_limit: int = 40,
+        mmr_lambda: float | None = None,
     ) -> list[Hit]:
-        """Dense + sparse prefetch branches fused with DBSF; filters applied
-        inside each branch (true pre-filter)."""
+        """Dense + sparse prefetch branches, filters applied inside each
+        branch (true pre-filter). Final selection is DBSF fusion, or MMR
+        diversification over the candidates when mmr_lambda is set."""
         sparse_query = SparseVector(indices=emb.sparse_indices, values=emb.sparse_values)
         prefetches = [
             Prefetch(query=Query.Nearest(emb.dense, using=DENSE), filter=flt,
@@ -198,10 +201,15 @@ class EdgeBackend:
                 Prefetch(query=Query.Nearest(sparse_query, using=SPARSE), filter=flt,
                          limit=prefetch_limit)
             )
+        if mmr_lambda is not None:
+            final = Mmr(emb.dense, lambda_=mmr_lambda,
+                        candidates_limit=prefetch_limit, using=DENSE)
+        else:
+            final = Fusion.Dbsf()
         results = self._shard.query(
             QueryRequest(
                 prefetches=prefetches,
-                query=Fusion.Dbsf(),
+                query=final,
                 limit=k,
                 with_payload=True,
             )

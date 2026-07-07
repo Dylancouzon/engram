@@ -106,7 +106,16 @@ QueryRequest(
 
 `Fusion.Rrf(k: int, weights: Optional[List[float]])`, `Fusion.Dbsf()`.
 
-### Formula / decay (present in stub; no real-usage confirmation)
+### Formula / decay — probed 2026-07-06, LIMITED
+
+Verified empirically on 0.7.2: `Variable("score")` NEVER binds the real
+prefetch/fused score — it only reads payload fields or `defaults`, flat or
+nested, so server-side "similarity x decay" blending is impossible. Formula
+requires >=1 prefetch. `Expression.Decay` requires `midpoint` positionally
+(stub lies) and works on float-epoch payloads via `Variable`; `DatetimeKey`
+needs ISO-string payloads. Consequence: engram rescores app-side.
+
+### Formula / decay (stub signatures)
 
 ```python
 class Formula:  # pass as QueryRequest(query=Formula(...))
@@ -118,7 +127,13 @@ Expression.Decay(kind: DecayKind, x, target=None, midpoint=None, scale=None)
 DecayKind: Lin, Gauss, Exp
 ```
 
-### MMR (verified in edge-mission-control)
+### MMR (verified; composes with hybrid prefetches — probed 2026-07-06)
+
+`QueryRequest(prefetches=[dense, sparse], query=Mmr(dense_vec, lambda_,
+candidates_limit, using="dense"), limit=k)` works: prefetch filters/branches
+genuinely constrain the candidate set; MMR diversifies over the dense vector.
+
+### MMR (original reference)
 
 ```python
 QueryRequest(query=Mmr(vector, lambda_=0.9, candidates_limit=100, using="dense"),

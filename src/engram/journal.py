@@ -32,11 +32,12 @@ from typing import Any, TextIO
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS journal (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    op TEXT NOT NULL,               -- 'upsert' | 'delete' | 'reinforce'
+    op TEXT NOT NULL,               -- 'upsert' | 'delete' | 'reinforce' | audit rows
     memory_id TEXT NOT NULL,
     idempotency_key TEXT UNIQUE,
     payload TEXT,                   -- JSON Memory payload for upsert; counters for reinforce
-    ts REAL NOT NULL
+    ts REAL NOT NULL,
+    shard TEXT NOT NULL DEFAULT 'private'
 );
 CREATE INDEX IF NOT EXISTS journal_memory_id ON journal (memory_id);
 CREATE TABLE IF NOT EXISTS tombstones (
@@ -57,11 +58,12 @@ class JournalEntry:
     memory_id: str
     payload: dict[str, Any] | None
     ts: float
+    shard: str = "private"
 
     def to_json(self) -> str:
         return json.dumps(
             {"seq": self.seq, "op": self.op, "memory_id": self.memory_id,
-             "payload": self.payload, "ts": self.ts},
+             "payload": self.payload, "ts": self.ts, "shard": self.shard},
             ensure_ascii=False,
         )
 
@@ -82,6 +84,12 @@ class Journal:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.executescript(_SCHEMA)
+        # Pre-shard journals lack the shard column; migrate in place.
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(journal)")}
+        if "shard" not in cols:
+            self._conn.execute(
+                "ALTER TABLE journal ADD COLUMN shard TEXT NOT NULL DEFAULT 'private'"
+            )
         self._conn.commit()
 
     # -- append (the ack point) -------------------------------------------
@@ -92,13 +100,16 @@ class Journal:
         memory_id: str,
         payload: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
+        shard: str = "private",
     ) -> int:
         """Durably record one write intent. Returns its seq.
         A duplicate idempotency_key returns the existing seq (retry-safe)."""
-        return self.append_many([(op, memory_id, payload, idempotency_key)])[-1]
+        return self.append_many([(op, memory_id, payload, idempotency_key)], shard=shard)[-1]
 
     def append_many(
-        self, intents: list[tuple[str, str, dict[str, Any] | None, str | None]]
+        self,
+        intents: list[tuple[str, str, dict[str, Any] | None, str | None]],
+        shard: str = "private",
     ) -> list[int]:
         """Atomically record several intents (e.g. supersede = 2 upserts)."""
         seqs: list[int] = []
@@ -112,11 +123,11 @@ class Journal:
                         seqs.append(row[0])
                         continue
                 cur = self._conn.execute(
-                    "INSERT INTO journal (op, memory_id, idempotency_key, payload, ts)"
-                    " VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO journal (op, memory_id, idempotency_key, payload, ts, shard)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
                     (op, memory_id, key,
                      json.dumps(payload, ensure_ascii=False) if payload is not None else None,
-                     time.time()),
+                     time.time(), shard),
                 )
                 seqs.append(cur.lastrowid)
         return seqs
@@ -225,11 +236,13 @@ class Journal:
                             if isinstance(payload.get(key), str):
                                 payload[key] = scrub(payload[key])
                     self._conn.execute(
-                        "INSERT INTO journal (op, memory_id, payload, ts) VALUES (?, ?, ?, ?)",
+                        "INSERT INTO journal (op, memory_id, payload, ts, shard)"
+                        " VALUES (?, ?, ?, ?, ?)",
                         (row["op"], row["memory_id"],
                          json.dumps(payload, ensure_ascii=False)
                          if payload is not None else None,
-                         row.get("ts", time.time())),
+                         row.get("ts", time.time()),
+                         row.get("shard", "private")),
                     )
                 n += 1
         return n
@@ -238,12 +251,14 @@ class Journal:
 
     def _iter_rows(self, where: str, params: tuple) -> Iterator[JournalEntry]:
         cur = self._conn.execute(
-            f"SELECT seq, op, memory_id, payload, ts FROM journal {where} ORDER BY seq", params
+            f"SELECT seq, op, memory_id, payload, ts, shard FROM journal {where} ORDER BY seq",
+            params,
         )
-        for seq, op, memory_id, payload, ts in cur:
+        for seq, op, memory_id, payload, ts, shard in cur:
             yield JournalEntry(
                 seq=seq, op=op, memory_id=memory_id,
                 payload=json.loads(payload) if payload else None, ts=ts,
+                shard=shard or "private",
             )
 
     def close(self) -> None:

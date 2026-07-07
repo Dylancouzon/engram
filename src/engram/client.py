@@ -130,21 +130,22 @@ class Client:
     def remember(self, text: str, type: MemoryType | None = None,
                  tags: list[str] | None = None, scope: str = "default",
                  importance: float | None = None, surface: str | None = None,
-                 source_ref: str | None = None) -> list[WriteAction]:
+                 source_ref: str | None = None, shard: str = "private") -> list[WriteAction]:
         result = self.call(
             "remember", text=text, type=type.value if type else None,
             tags=tags, scope=scope, importance=importance, source_ref=source_ref,
+            shard=shard,
         )
         return [action_from_wire(a) for a in result["actions"]]
 
     def recall(self, query: str, k: int | None = None,
                scope: str | None = None, type: MemoryType | None = None,
                tags: list[str] | None = None, as_of: float | None = None,
-               reinforce: bool = True) -> list[RecallHit]:
+               reinforce: bool = True, shard: str | None = None) -> list[RecallHit]:
         result = self.call(
             "recall", query=query, k=k, scope=scope,
             type=type.value if type else None, tags=tags, as_of=as_of,
-            reinforce=reinforce,
+            reinforce=reinforce, shard=shard,
         )
         return [hit_from_wire(h) for h in result["hits"]]
 

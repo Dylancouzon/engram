@@ -187,6 +187,7 @@ class Daemon:
             importance=params.get("importance"),
             surface=client,
             source_ref=params.get("source_ref"),
+            shard=params.get("shard") or "private",
         )
         return {"actions": [action_to_wire(a) for a in actions]}
 
@@ -208,6 +209,7 @@ class Daemon:
             tags=params.get("tags"),
             as_of=params.get("as_of"),
             reinforce=bool(params.get("reinforce", True)),
+            shard=params.get("shard"),
         )
         return {"hits": [hit_to_wire(h) for h in hits]}
 
