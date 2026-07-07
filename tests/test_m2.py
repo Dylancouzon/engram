@@ -5,7 +5,7 @@ import time
 import pytest
 from conftest import FakeEmbedder, FakeLLM, make_store
 
-from engram.archive import restore_snapshot
+from engram.archive import read_snapshot, restore_snapshot
 from engram.config import Config
 from engram.models import MemoryType, now_ts
 from engram.store import MemoryStore
@@ -19,8 +19,13 @@ def test_snapshot_restore_roundtrip_encrypted(config, tmp_path):
     size = store.snapshot(snap, passphrase="correct horse")
     store.close()
     assert size > 0
-    # Encrypted: memory text must not appear in the artifact bytes.
-    assert b"Miso" not in snap.read_bytes()
+    # Encrypted: the artifact is a Fernet blob, not a readable tar. (A
+    # plaintext-substring check would be flaky — base64 ciphertext collides
+    # with short needles — so assert the security property structurally.)
+    raw = snap.read_bytes()
+    assert raw.startswith(b"ENGRAM1")  # encrypted-snapshot magic, not gzip
+    with pytest.raises(ValueError):  # cannot be opened without the passphrase
+        read_snapshot(snap, None)
 
     dest = Config(data_dir=tmp_path / "second-machine", dense_dim=config.dense_dim)
     with pytest.raises(ValueError):  # wrong passphrase refused
