@@ -309,6 +309,14 @@ class Journal:
                 (kind, time.time(), hits),
             )
 
+    def recent_events(self, limit: int = 50) -> list[tuple[str, float, int]]:
+        """Newest firings first: (kind, ts, hits) — feeds `engram log`."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT kind, ts, hits FROM events ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
     def event_summary(self) -> dict[str, dict[str, int]]:
         """Per-kind: fired count + how often at least one memory surfaced —
         the M1 recall-at-the-right-moment proxy."""

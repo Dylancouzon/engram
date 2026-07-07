@@ -157,12 +157,28 @@ class Client:
         return bool(self.call("forget", id=memory_id, mode=mode)["forgotten"])
 
     def get(self, memory_id: str) -> Memory | None:
+        """By full id or unambiguous short prefix (the daemon resolves both)."""
         try:
             return memory_from_wire(self.call("get", id=memory_id)["memory"])
         except ProtocolError as e:
             if e.code == "not_found":
                 return None
             raise
+
+    def list(self, scope: str | None = None, type: MemoryType | None = None,
+             shard: str | None = None, include_invalid: bool = False,
+             limit: int | None = None) -> list[Memory]:
+        result = self.call(
+            "list", scope=scope, type=type.value if type else None,
+            shard=shard, include_invalid=include_invalid, limit=limit,
+        )
+        return [memory_from_wire(m) for m in result["memories"]]
+
+    def log_event(self, kind: str, hits: int = 0) -> None:
+        self.call("log_event", kind=kind, hits=hits)
+
+    def recent_events(self, limit: int = 50) -> list[dict]:
+        return list(self.call("events", limit=limit)["events"])
 
     def stats(self) -> dict:
         return dict(self.call("stats"))
@@ -183,8 +199,8 @@ class Client:
     def sync(self, shard: str) -> dict:
         return dict(self.call("sync", shard=shard))
 
-    def consolidate(self, budget: int = 50) -> dict:
-        return dict(self.call("consolidate", budget=budget))
+    def consolidate(self) -> dict:
+        return dict(self.call("consolidate"))
 
     def snapshot(self, path: str, passphrase: str | None) -> int:
         return int(self.call("snapshot", path=path, passphrase=passphrase)["bytes"])

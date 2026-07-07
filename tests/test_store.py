@@ -258,3 +258,47 @@ def test_rebuild_from_journal_alone(config):
         assert all(h.memory.id != b.memory.id for h in reopened.recall("lives in Paris"))
     finally:
         reopened.close()
+
+
+def test_resolve_target_hex_never_falls_through_to_search(store):
+    """A short id (what the CLI prints) resolves by prefix; an unknown
+    hex string resolves to NOTHING — never to a semantic search hit,
+    which once let `forget <typo> --yes` purge the wrong memory."""
+    from engram.cli import _resolve_target
+
+    [action] = store.remember("Dylan's cat is named Miso")
+    short = action.memory.id.split("-")[0]
+    assert _resolve_target(store, short).id == action.memory.id
+    assert _resolve_target(store, action.memory.id).id == action.memory.id
+    assert _resolve_target(store, "deadbeef") is None
+    # Non-hex text still resolves by search (documented behavior).
+    assert _resolve_target(store, "cat named Miso").id == action.memory.id
+
+
+def test_list_browses_without_query(store):
+    store.remember("Dylan's cat is named Miso", scope="personal")
+    store.remember("Correction: the cat is named Mochi", scope="personal")
+    listed = store.list()
+    assert all(m.is_valid for m in listed)
+    everything = store.list(include_invalid=True)
+    assert len(everything) >= len(listed)
+    assert store.list(limit=1) and len(store.list(limit=1)) == 1
+
+
+def test_dashboard_renders_memories_and_events(store):
+    from engram.dashboard import render_dashboard
+
+    store.remember("Dylan's cat is named Miso")
+    store.log_event("prompt-recall", hits=1)
+    memories = [
+        {"id": m.id, "text": m.text, "type": m.type.value, "scope": m.scope,
+         "tags": m.tags, "created_at": m.created_at,
+         "access_count": m.access_count, "valid": m.is_valid}
+        for m in store.list(include_invalid=True)
+    ]
+    html = render_dashboard(memories, store.recent_events(10), store.stats())
+    assert "Miso" in html and "prompt-recall" in html
+    # The embedded JSON escapes "</" so memory text can never break out of
+    # the <script type="application/json"> element.
+    payload = html.split('id="data">')[1].split("</script>")[0]
+    assert "</" not in payload

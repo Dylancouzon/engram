@@ -63,10 +63,6 @@ class Config:
     ollama_url: str = "http://localhost:11434"
     extraction_model: str = "qwen3:4b"
 
-    # Footprint: int8 scalar quantization of dense vectors (~4x smaller
-    # index). Applies at shard creation; run `engram rebuild` after changing.
-    quantize: bool = False
-
     # Redaction
     redaction_enabled: bool = True
 

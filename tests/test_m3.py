@@ -1,5 +1,5 @@
 """M3: two-device encrypted sync (LWW merge, tombstone suppression,
-private-never-syncs) and capability tokens + per-method grants."""
+private-never-syncs) and capability tokens."""
 
 import shutil
 
@@ -268,12 +268,25 @@ def test_token_required_and_verified(config, daemon):  # noqa: F811
         assert any("token-authed" in h.memory.text for h in c.recall("token"))
 
 
-def test_method_grants_enforced(config, daemon):  # noqa: F811
-    ClientRegistry(config).allow("readonly", ["*"], methods=["recall"])
-    with _client(config, "cli") as owner:
-        owner.remember("Dylan's cat is named Miso")
-    with _client(config, "readonly") as c:
-        assert c.recall("cat")  # granted
-        with pytest.raises(ProtocolError) as exc:
-            c.remember("sneaky write")
-        assert exc.value.code == "scope_denied"
+def test_get_by_short_prefix_via_daemon(config, daemon):  # noqa: F811
+    # The forget-by-short-id workflow (the CLI prints truncated ids) must
+    # resolve through the daemon too. It once fell through to semantic
+    # search, which could purge whatever memory the hex string scored
+    # against; an unknown prefix must resolve to nothing, never a guess.
+    with _client(config, "cli") as c:
+        [action] = c.remember("Dylan's cat is named Miso")
+        full_id = action.memory.id
+        assert c.get(full_id.split("-")[0]).id == full_id
+        assert c.get("deadbeef") is None
+
+
+def test_list_and_event_log_via_daemon(config, daemon):  # noqa: F811
+    with _client(config, "cli") as c:
+        c.remember("Dylan's cat is named Miso")
+        c.remember("Dylan flies to Berlin on Friday")
+        texts = {m.text for m in c.list()}
+        assert {"Dylan's cat is named Miso",
+                "Dylan flies to Berlin on Friday"} <= texts
+        c.log_event("prompt-recall", hits=2)
+        events = c.recent_events()
+        assert events[0]["kind"] == "prompt-recall" and events[0]["hits"] == 2

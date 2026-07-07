@@ -1,8 +1,11 @@
 """Consolidation: the housekeeping that keeps a growing memory clean.
 
-Runs as a well-behaved writer — bounded per run, cancellable between
-items, checkpointed via the journal's meta table, and invoked only when
-the daemon has been idle (or manually via `engram consolidate`).
+Runs as a well-behaved writer — cancellable between items (so a daemon
+shutdown never blocks on a model call), checkpointed via the journal's
+meta table, and invoked only when the daemon has been idle (or manually
+via `engram consolidate`). Runs are unbounded: at personal-memory scale a
+full pass is fast; budgeting can return if dogfood data ever shows a run
+long enough to matter.
 
 Three passes, cheapest first:
 - decay-prune: stale, never-recalled episodic memories fade out
@@ -47,10 +50,9 @@ Respond with JSON: {"summary": "..."} or {"summary": null} if nothing durable re
 
 def consolidate(
     store: MemoryStore,
-    budget: int = 50,
     stop: threading.Event | None = None,
 ) -> dict[str, int]:
-    """One bounded consolidation run. Returns per-pass counts."""
+    """One consolidation run. Returns per-pass counts."""
     report = {"pruned": 0, "deduped": 0, "summarized": 0}
     now = now_ts()
     # Memories awaiting an owner decision are off-limits: consolidation must
@@ -62,9 +64,6 @@ def consolidate(
 
     def cancelled() -> bool:
         return stop is not None and stop.is_set()
-
-    def spent() -> int:
-        return sum(report.values())
 
     with store._write_lock:
         for shard, backend in list(store.backends.items()):
@@ -78,7 +77,7 @@ def consolidate(
 
             # -- decay-prune ----------------------------------------------------
             for m in valid:
-                if cancelled() or spent() >= budget:
+                if cancelled():
                     break
                 if m.type is not MemoryType.EPISODIC or m.access_count > 0:
                     continue
@@ -99,7 +98,7 @@ def consolidate(
 
             seen: dict[str, Memory] = {}
             for m in sorted(valid, key=lambda m: m.created_at):
-                if cancelled() or spent() >= budget:
+                if cancelled():
                     break
                 if not m.is_valid or m.id in protected:
                     continue
@@ -123,14 +122,11 @@ def consolidate(
                         for tag in m.tags or ["untagged"]:
                             groups[(m.scope, tag)].append(m)
                 for (scope, _tag), episodes in groups.items():
-                    if cancelled() or spent() >= budget:
+                    if cancelled():
                         break
                     episodes = [e for e in episodes
                                 if e.is_valid and e.id not in protected]
                     if len(episodes) < SUMMARIZE_MIN_GROUP:
-                        continue
-                    # A group costs what it touches, not one budget unit.
-                    if spent() + len(episodes) + 1 > budget:
                         continue
                     listing = "\n".join(
                         f"- ({time.strftime('%Y-%m-%d', time.localtime(e.created_at))}) "
@@ -160,9 +156,9 @@ def consolidate(
                     report["summarized"] += 1
 
     store.journal.mark_flushed(store._applied_seq)
-    if not cancelled() and spent() < budget:
-        # Only a COMPLETED run advances the daily checkpoint; an exhausted or
-        # cancelled run should resume at the next idle window instead.
+    if not cancelled():
+        # Only a COMPLETED run advances the daily checkpoint; a cancelled
+        # run should resume at the next idle window instead.
         store.journal.set_meta("consolidated_at", str(now))
     return report
 

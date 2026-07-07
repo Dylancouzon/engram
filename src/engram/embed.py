@@ -10,6 +10,7 @@ miniCOIL has its own query path (query_embed weights terms for matching).
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +32,17 @@ class Embedder:
 
     def _models(self):
         if self._dense is None:
+            cache = Path(self._cache_dir)
+            if not cache.exists() or not any(cache.iterdir()):
+                # The very first command a new user runs lands here and would
+                # otherwise stare at a silent terminal for the whole download.
+                # stderr: hook stdout is injected into assistant context.
+                print(
+                    "engram: first run — downloading local embedding models"
+                    f" (~600 MB) to {cache}. This happens once and can take"
+                    " a few minutes; everything after is offline.",
+                    file=sys.stderr, flush=True,
+                )
             # Import here: fastembed pulls in onnxruntime, which is slow to
             # import and unneeded for journal-only commands (export, forget).
             from fastembed import SparseTextEmbedding, TextEmbedding

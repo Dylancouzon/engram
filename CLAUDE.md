@@ -26,6 +26,18 @@ verbatim; the sync LWW clock counts only content ops (a local read/dedup can
 no longer shadow a remote edit); `engram hook install` offers the daemon so
 the proactive-recall path isn't slow by default.
 
+An adoption/simplification pass (July 2026, three-agent audit + fixes)
+changed the surface significantly — see "Adoption pass" in the decision log.
+Highlights: fixed a data-loss bug in `forget <short-id>` under the daemon;
+added the transparency surface (`list`/`log`/`dashboard`, disk usage +
+pending reviews in `stats`); hook events now log through the protocol (they
+were silently dropped in daemon mode — the dogfood metric depends on this);
+cut per-method grants, the consolidation budget machinery, the `quantize`
+knob, and `hook print-config`. Distribution name is now **qdrant-engram**
+(PyPI `engram` is squatted and the name collides with several AI-memory
+projects); the CLI/module stay `engram`. Packaging (uvx/plugin-marketplace/
+.mcpb) is deliberately parked until Dylan has dogfooded.
+
 Not built (deliberate cuts, not omissions): Wave-C/D ingestion adapters
 (email/messages/voice/CLIP) — the adapter *contract* is documented in
 `docs/ingestion.md` and the write path is proven, so these are per-source
@@ -39,10 +51,15 @@ Compete on **ownership**, not algorithms. Do NOT try to out-engineer the
 funded memory players (Mem0, Zep, Letta, cognee) on extraction quality —
 concede that. engram competes with the **cloud built-ins** (ChatGPT/Claude/
 Gemini memory) on ownership / privacy / portability — a lane their business
-model can't follow into — and with Basic Memory (local but not capable) /
-the niche OpenMemory is vacating. Target user: ownership/privacy-motivated
-multi-tool power users, not the mass market. When a design choice trades
-capability for ownership/portability/privacy, take ownership.
+model can't follow into. Verified mid-2026: all three built-ins are
+personal-only (no team/shared memory), capacity-capped, and export-hostile —
+the wedge is real. Nearest OSS neighbors have moved, though: **Basic
+Memory** is no longer "local but not capable" (it now has hybrid semantic
+search, a knowledge graph, Obsidian sync) and **claude-mem** (~65k stars)
+owns the Claude-Code-hooks lane with a 2-command plugin install. Do a fresh
+feature diff before writing public comparisons. Target user: ownership/
+privacy-motivated multi-tool power users, not the mass market. When a design
+choice trades capability for ownership/portability/privacy, take ownership.
 
 Qdrant is a **vector search engine**, never a "vector database", in all copy.
 Public copy (README, docs) goes through the `qdrant-messaging` skill.
@@ -115,10 +132,12 @@ Everything else is a consequence of protecting that invariant.
   with library-mode fallback so zero-setup still works.
 - Auth: socket is 0600 (OS excludes other users). Client-name registration +
   per-client scope allowlists, **default-deny** except an implicit `cli`
-  client. Capability tokens (hashed in clients.json, shown once) + per-method
-  grants added in M3. Client names are self-declared — this is consent
-  bookkeeping, NOT a security boundary against a hostile same-user process
-  (documented; real defense is the token).
+  client. Capability tokens (hashed in clients.json, shown once) added in
+  M3. Client names are self-declared — this is consent bookkeeping, NOT a
+  security boundary against a hostile same-user process (documented; real
+  defense is the token). Per-method grants existed briefly and were cut in
+  the adoption pass: nothing wired them up, nobody asked, scopes + tokens
+  cover the realistic cases.
 - Reads are lock-free; writes serialize through `store._write_lock`.
   Reinforcement (access bumps) is **buffered** in the daemon and drained on
   idle/close, so reads never write; and each bump **collapses** to one journal
@@ -168,17 +187,50 @@ Everything else is a consequence of protecting that invariant.
   candidates.
 
 **Consolidation (M2).** Idle-only daemon job (or `engram consolidate`),
-bounded/cancellable/checkpointed, all through journaled writes: decay-prune
+cancellable/checkpointed, all through journaled writes: decay-prune
 stale never-recalled episodes (60d half-life, slower than recall ranking),
 normalized-text dedup (keep oldest), episodic→semantic LLM summarization (≥3
 old episodes sharing scope+tag). Protects memories with a pending review.
-Only a COMPLETED run advances the daily checkpoint.
+Only a COMPLETED run advances the daily checkpoint. The per-run `budget`
+accounting was cut in the adoption pass (a scale problem personal stores
+don't have); the `stop` event stays — daemon shutdown must not block on a
+model call.
 
 **Snapshot/restore (M2).** `archive.py`: quiesced tar.gz of the durable state,
 scrypt→Fernet passphrase encryption by default (magic `ENGRAM1` + salt header).
 Snapshot checkpoints the SQLite WAL first (else the tar misses recent writes).
-Restore refuses a non-empty dir. Quantization: optional int8 scalar
-(`config.quantize`, ~4× smaller index, `engram rebuild` after changing).
+Restore refuses a non-empty dir. (An int8 quantization knob existed and was
+cut in the adoption pass — premature at personal-memory scale.)
+
+**Adoption pass (July 2026).** Three sub-agent audits (over-engineering,
+competitive landscape, adoption funnel) → one fix batch, Dylan-approved:
+- **forget-by-short-id bug (data loss class):** `_resolve_target` fell
+  through to semantic search for hex prefixes in daemon mode; `--yes` could
+  hard-purge the wrong memory. Now: hex-like targets resolve by exact id or
+  unambiguous prefix (`store.find_by_prefix`, prefix-aware daemon `get`) and
+  NEVER fall through to search. Test coverage both modes.
+- **Transparency surface** (the ownership pitch, made visible): `engram
+  list` (browse, `--all`), `engram log` (hook audit trail), `engram
+  dashboard` (static self-contained HTML written into the 0700 data dir —
+  deliberately not a served app: no port, no new attack surface), `stats`
+  grew disk usage + pending_reviews. New protocol methods: `list`,
+  `log_event`, `events`.
+- **Hook events now go through the store surface** (`store.log_event`,
+  client passthrough): they were journal-direct and silently dropped in
+  daemon mode, which would have starved the events-table dogfood metric.
+- **Review queue surfaced** instead of cut: session-start hook injects a
+  "N conflicts await `engram review`" line so the assistant relays it.
+- **First-run UX:** embed.py announces the ~600 MB model download on stderr
+  (stderr because hook stdout is injected into model context); `hook
+  install` warns when Ollama is missing (capture would silently no-op).
+- **Naming:** distribution = `qdrant-engram` (PyPI `engram` is squatted;
+  several unrelated "Engram" AI-memory projects exist, incl. engram.fyi).
+  CLI, module, and `~/.engram` stay `engram`.
+- **Cuts:** per-method grants, consolidation budget, `quantize`, `hook
+  print-config`. LICENSE file added (GitHub license detection needs the
+  file, not just pyproject metadata). README: real clone URL
+  (Dylancouzon/engram until the org transfer), 3.12-pin explanation,
+  uninstall section, See What It Knows section, cloud built-ins wedge.
 
 **Sync (M3).** `sync.py`: push chosen shards to a standard Qdrant Cloud
 collection used as a **dumb ciphertext relay** (1-dim dummy vector). Each
@@ -226,9 +278,10 @@ model downloads; sync tests use `QdrantClient(":memory:")` as the relay.
 - `uv run python golden/harness.py -v` — write-model accuracy (real models;
   needs Ollama for non-ADD ops)
 - `uv run ruff check src tests`
-- `uv run engram --help` — CLI. Key verbs: `remember/recall/forget`, `review`,
-  `seed <files|dirs>`, `export/import`, `snapshot/restore`, `sync setup/now`,
-  `consolidate`, `daemon [--install]`, `clients allow/revoke/list`, `hook
+- `uv run engram --help` — CLI. Key verbs: `remember/recall/forget`,
+  `list/log/dashboard` (transparency surface), `review`, `seed <files|dirs>`,
+  `export/import`, `snapshot/restore`, `sync setup/now`, `consolidate`,
+  `daemon [--install]`, `clients allow/revoke/list`, `hook
   install|session-start|user-prompt|capture`, `rules <surface>`, `mcp
   --client`, `stats/rebuild`.
 - `ENGRAM_HOME` overrides `~/.engram`. `ENGRAM_SOCKET` overrides the socket

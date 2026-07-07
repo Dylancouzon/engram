@@ -1,22 +1,20 @@
-# engram
+# Qdrant Engram
 
 **A personal, long-term memory for AI assistants. Local, portable, and yours.**
 
 Every AI assistant you use is building a memory of you right now, and none of
 them share it. Your preferences live in ChatGPT's cloud, your corrections in
-Claude's, your project context in Cursor's. Switch tools and you start over.
-Cancel a subscription and that memory is gone. You can't read it, move it, or
-truly delete it.
+Claude's, your project context in Cursor's. Switch tools and you start over;
+cancel a subscription and that memory is gone.
 
 engram puts that memory in a folder you own. Assistants write to it and
 recall from it; you decide which apps see what, which parts sync, and what
-gets forgotten. It runs fully offline: embedding, retrieval, and extraction
-all happen on your machine, with no cloud in the loop.
+gets forgotten. Embedding, retrieval, and extraction all run offline on your
+machine.
 
-> **Status: beta.** The full engine works today: write model with conflict
-> resolution, hybrid retrieval, daemon + MCP, consolidation, encrypted
-> snapshots, and multi-device sync. Built on Qdrant Edge, which is itself in
-> beta. APIs may still change.
+> **Status: beta**, built on Qdrant Edge (itself in beta). APIs may change;
+> your data doesn't depend on them: every memory lives in a plain-text
+> journal that `engram export` dumps and any future version replays.
 
 ## How It Works
 
@@ -38,152 +36,153 @@ $ engram forget fb80d689 --hard
 purged: index, journal, and future exports.
 ```
 
-Writing is not appending. Each new memory is checked against what's already
-known: corrections supersede the stale fact, refinements update it,
-duplicates reinforce it, and anything the local judge is unsure about is
-kept safe and queued for your call (`engram review`). A small local model
-(Qwen3 via [Ollama](https://ollama.com)) makes those calls; without it,
-engram still works and stores verbatim. On a 25-case golden set graded
-against the real local models, the write model picks the right operation 84%
-of the time and surfaces the right memory on every recall (100%); the harness
-lives in `golden/`, so you can check the number yourself.
+Writing is not appending: a small local model (Qwen3 via
+[Ollama](https://ollama.com)) checks each new memory against what's known.
+Corrections supersede, refinements update, duplicates reinforce; anything
+uncertain is stored safely and queued for `engram review`. Without Ollama,
+engram still works and stores verbatim. On a 25-case golden set (`golden/`),
+the write model picks the right operation 84% of the time and surfaces the
+right memory on every recall.
 
-Recall is retrieval, not keyword grep: hybrid dense + sparse search
+Recall is hybrid dense + sparse search
 ([nomic-embed](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) +
-[miniCOIL](https://huggingface.co/Qdrant/minicoil-v1), both local via
-[FastEmbed](https://github.com/qdrant/fastembed)), MMR diversification,
-payload pre-filtering by scope and temporal validity, decayed by recency,
-weighted by importance. The engine is [Qdrant Edge](https://qdrant.tech/edge/),
-the in-process build of the Qdrant vector search engine: server-class
-retrieval running inside the process, like SQLite.
+[miniCOIL](https://huggingface.co/Qdrant/minicoil-v1) via
+[FastEmbed](https://github.com/qdrant/fastembed)), pre-filtered by scope and
+temporal validity, decayed by recency, weighted by importance. The engine is
+[Qdrant Edge](https://qdrant.tech/edge/), the in-process build of the Qdrant
+vector search engine: like SQLite, but for search.
 
-## Working With Coding Agents
+## Claude Code, Wired In
 
-The three verbs are the manual path. With Claude Code, engram runs inside the
-assistant's normal loop, wired in by one command:
+One command puts engram inside the assistant's loop:
 
 ```bash
-engram hook install claude-code   # installs the hooks, offers to run the daemon
+engram hook install claude-code   # installs the hooks, offers the daemon
 ```
 
-After that, every session:
+Every session then recalls against each prompt (confident matches are
+injected before the model answers), loads project context at session start,
+and captures durable facts through the full write pipeline when the session
+ends. Recall gates on similarity, so unrelated prompts inject nothing;
+capture needs the local model. Editors without hooks (Cursor, Windsurf) get
+a paste-in rules block: `engram rules cursor`.
 
-- **Recalls on every prompt.** Before the model answers, engram searches your
-  memory against what you just typed and injects the confident matches. The
-  model never has to decide to look: the relevant correction or preference is
-  already in context.
-- **Loads project context at the start.** Opening a project surfaces the
-  decisions, conventions, and corrections tied to it.
-- **Saves when the session ends.** On stop (or when a long session compacts),
-  engram harvests the durable facts from what you said and runs them through
-  the write pipeline: redaction, extraction, dedup, conflict resolution.
-  Filler is dropped; a correction supersedes the stale fact.
+## Plug In Other Assistants
 
-Recall is gated on similarity, so an unrelated prompt injects nothing. Saving
-needs the local model to tell a fact from filler; without it, capture is a
-no-op and you write with `remember` yourself.
-
-Hooks are the floor: recall-at-the-right-moment that doesn't depend on the
-model choosing to act. The MCP tools below are the supplement, for the model
-to recall or remember mid-conversation. Editors without hook support (Cursor,
-Windsurf) get a paste-in rules block instead: `engram rules cursor`.
-
-## Plug It Into Your Assistants
-
-A long-lived daemon owns your memory folder; the CLI and MCP servers are
-thin clients of it. Each app must be granted access first (default-deny),
-and you control which scopes it sees:
+A daemon owns your memory folder; the CLI and MCP servers are thin clients.
+Apps are default-deny and scope-limited:
 
 ```bash
 engram clients allow claude-code --scopes '*'
 claude mcp add engram -- engram mcp --client claude-code
 ```
 
-For Claude Desktop or Cursor, register a client name the same way and add
-to the app's MCP config:
+For Claude Desktop or Cursor, register a client name and add:
 
 ```json
 {"mcpServers": {"engram": {"command": "engram", "args": ["mcp", "--client", "cursor"]}}}
 ```
 
-The assistant gets three tools: `remember`, `recall`, and `forget`. A
-correction made in one app supersedes the stale fact everywhere, because
-there is only one memory. Apps granted `--scopes work` never see `personal`
-memories; add `--token --methods remember` for least-privilege ingestion
-adapters (see `docs/ingestion.md`).
+The assistant gets `remember`, `recall`, and `forget`. One memory, every
+app: a correction made anywhere supersedes the stale fact everywhere. Apps
+granted `--scopes work` never see `personal`; add `--token` to require a
+capability token (see `docs/ingestion.md`).
 
 ## Trust Boundaries and Sync
 
 Memories live in shards that set their blast radius:
 
-- **`private`** (default): never syncs. There is no code path that uploads
-  it. Moving a memory out of `private` is a deliberate act.
+- **`private`** (default): never syncs. There is no code path that uploads it.
 - **`me-synced`**: your own memories, across your devices.
 - **`shared:<group>`**: opt-in pools (family, team).
 
-Sync uses a standard Qdrant Cloud collection as a dumb relay: each memory's
-text and embeddings travel as ciphertext, encrypted with a key that never
-leaves your devices. The relay never sees content or vectors; it does see
-routing metadata (memory ids, timestamps, device names), which is what lets
-devices merge. Merge happens locally: last-write-wins by timestamp, and a
-hard forget propagates as a content-free tombstone that purges the memory
-everywhere.
+Sync uses a Qdrant Cloud collection as a dumb relay: memories travel as
+ciphertext, encrypted with a key that never leaves your devices. The relay
+sees only routing metadata (ids, timestamps, device names). Merge happens
+locally, last-write-wins; a hard forget propagates as a content-free
+tombstone that purges the memory everywhere.
 
 ```bash
 engram sync setup --shard me-synced --url https://<cluster>.qdrant.io --api-key ...
 engram sync now
 ```
 
+Cloud built-ins offer none of this: ChatGPT, Claude, and Gemini memories are
+personal-only, locked to one assistant, and export as copy-paste at best.
+
+## See What It Knows
+
+A memory you can't inspect is one you're trusting, not owning:
+
+```console
+$ engram list        # browse every memory, newest first
+$ engram log         # what the hooks injected or captured, and when
+$ engram dashboard   # the same in your browser: search, filter, history
+$ engram stats       # counts, disk usage, pending reviews
+```
+
+The dashboard is one static HTML file in your memory folder: no server,
+nothing leaves the machine.
+
 ## What Ownership Means Here
 
-- **Local by default.** No account, no telemetry, no network calls. The
-  only network paths are localhost Ollama and the sync you explicitly set up.
+- **Local by default.** No account, no telemetry; the only network paths are
+  localhost Ollama and the sync you explicitly set up.
 - **Secrets never land.** A deterministic scrubber runs before anything is
-  extracted, embedded, or persisted. API keys and tokens are redacted;
-  private keys refuse the whole write.
+  extracted, embedded, or persisted; private keys refuse the whole write.
 - **Forgotten means gone.** `forget --hard` purges the journal (delete +
-  VACUUM) and rebuilds the search index without the memory, because a plain
-  index delete leaves content readable in storage pages. The tests grep raw
-  bytes across the whole folder to prove it, and the tombstone purges
-  synced copies on their next sync.
-- **Built to outlive any app.** `engram export` dumps the write journal as
-  JSONL: plain text, no vectors, no lock-in. Replaying it rebuilds your
-  memory on any machine, any future version, or any other engine.
-  `engram snapshot` backs up the whole folder as one encrypted file.
+  VACUUM) and rebuilds the index without the memory. Tests grep raw bytes
+  across the whole folder to prove it.
+- **No lock-in.** `engram export` dumps plain-text JSONL; replaying it
+  rebuilds your memory on any machine or engine. `engram snapshot` is the
+  encrypted one-file backup.
 - **Crash-safe.** Every write is journaled (SQLite) before it touches the
-  index. Kill the process at any point; nothing acknowledged is lost.
-- **Memory stays clean as it grows.** When idle, the daemon prunes stale
-  never-recalled episodes, collapses duplicates, and summarizes old event
-  clusters into durable facts (locally, via the same small model).
+  index; nothing acknowledged is lost.
+- **Stays clean as it grows.** When idle, the daemon prunes stale episodes,
+  collapses duplicates, and summarizes old event clusters into facts.
 
 ## Install
 
-Requires Python 3.12 on macOS (Apple Silicon) or Linux (x86_64/aarch64). The
-background daemon installs at login via launchd on macOS; on Linux, run
-`engram daemon` yourself (or wrap it in a systemd user unit). From source for
-now:
+Requires Python 3.12 exactly (the Qdrant Edge beta ships wheels for 3.12
+only; `uv sync` fails on 3.13) on macOS (Apple Silicon) or Linux
+(x86_64/aarch64). From source for now:
 
 ```bash
-git clone https://github.com/qdrant/engram && cd engram
+git clone https://github.com/Dylancouzon/engram && cd engram
 uv sync
 uv run engram remember "engram works"
 ```
 
-Optional pieces:
+The first command downloads the embedding models (~600 MB, once, to
+`~/.cache/engram`) and says so. Everything after runs offline.
+
+Optional:
 
 ```bash
 ollama pull qwen3:4b            # extraction + conflict resolution
 uv run engram daemon --install  # start at login (macOS launchd)
 ```
 
-Embedding models (~600 MB) download on first use and are cached per
-machine, not inside your memory folder.
+The daemon keeps recall warm for the hooks. On Linux, run `engram daemon`
+yourself (or wrap it in a systemd user unit).
+
+### Uninstall
+
+```bash
+launchctl unload -w ~/Library/LaunchAgents/tech.qdrant.engram.plist \
+  && rm ~/Library/LaunchAgents/tech.qdrant.engram.plist   # if daemon installed
+rm -rf ~/.engram          # your memories (snapshot first to keep them)
+rm -rf ~/.cache/engram    # the downloaded models
+```
+
+If you installed hooks, remove the `engram hook` entries from
+`~/.claude/settings.json` (the install saved a backup next to it).
 
 ## Reclaim Your Cloud Memory
 
-Your existing assistant memories import in one command. Copy them from
-ChatGPT (Settings → Personalization → Manage memories) or Claude into a
-markdown file, or point engram at a notes folder:
+Copy your saved memories from ChatGPT (Settings → Personalization) or Claude
+into a markdown file, or point engram at a notes folder. Every chunk goes
+through the full write pipeline:
 
 ```bash
 engram seed chatgpt-memories.md
@@ -191,14 +190,14 @@ engram seed ~/ObsidianVault --scope personal
 engram seed ~/.claude/CLAUDE.md
 ```
 
-Every chunk goes through the full write pipeline: redaction, extraction,
-dedup, conflict resolution.
-
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `engram remember / recall / forget` | The three verbs (`--shard`, `--scope` to target) |
+| `engram list` | Browse every memory, newest first (`--all` includes superseded) |
+| `engram log` | The hook audit trail: what was injected or captured, when |
+| `engram dashboard` | Browse and search everything in a local HTML file |
 | `engram review` | Decide queued conflicts the judge wasn't sure about |
 | `engram seed <files\|dirs>` | Import markdown through the write pipeline |
 | `engram export` / `import` | JSONL journal dump / replay (the no-lock-in guarantee) |
@@ -206,7 +205,7 @@ dedup, conflict resolution.
 | `engram sync setup / now` | Encrypted multi-device / shared-pool sync |
 | `engram consolidate` | Run housekeeping now instead of waiting for idle |
 | `engram daemon [--install]` | The memory-owning daemon (launchd install) |
-| `engram clients allow/revoke/list` | Per-app scopes, capability tokens, method grants |
+| `engram clients allow/revoke/list` | Per-app scopes and capability tokens |
 | `engram mcp --client <name>` | MCP server for one registered app |
 | `engram stats` / `rebuild` | Store health / re-index from the journal |
 

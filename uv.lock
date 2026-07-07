@@ -146,41 +146,6 @@ wheels = [
 ]
 
 [[package]]
-name = "engram"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "click" },
-    { name = "cryptography" },
-    { name = "fastembed" },
-    { name = "mcp" },
-    { name = "qdrant-client" },
-    { name = "qdrant-edge-py" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "click", specifier = ">=8.1" },
-    { name = "cryptography", specifier = ">=49.0.0" },
-    { name = "fastembed", specifier = ">=0.8.0" },
-    { name = "mcp", specifier = ">=1.28.1" },
-    { name = "qdrant-client", specifier = ">=1.18.0" },
-    { name = "qdrant-edge-py", specifier = ">=0.7.2" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "ruff", specifier = ">=0.8" },
-]
-
-[[package]]
 name = "fastembed"
 version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -774,6 +739,41 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/57/ae/18c6990c3a58628f97381e1494916120350fcf05c4d3dfcf82433cedb9a9/qdrant_edge_py-0.7.2-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:93b8c0b4f7d6fc58284dc0533d66bf18742767c1fbaef60ddd47651a79137e57", size = 10825604, upload-time = "2026-06-01T10:21:08.404Z" },
     { url = "https://files.pythonhosted.org/packages/a1/eb/a79ca27405196ad3da8f1fe88c7dc5b3888e25d531c6aed043c5efa48124/qdrant_edge_py-0.7.2-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:b13a892947b5eb2e8ac1a8049fd57a88d1b1d0a390ae2c432d1c0c8b8b0e3c0d", size = 11481427, upload-time = "2026-06-01T10:21:10.604Z" },
     { url = "https://files.pythonhosted.org/packages/dc/45/e7b1f28f82ba2392bc893ef65f20b8093c917396493f1ca43c1b2db56c09/qdrant_edge_py-0.7.2-cp310-abi3-win_amd64.whl", hash = "sha256:e6642e1f73ff28f6aeb2c377fdbe93dd0fa25db2d0c54936279e77e2d8ffb574", size = 10599513, upload-time = "2026-06-01T10:21:12.703Z" },
+]
+
+[[package]]
+name = "qdrant-engram"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "click" },
+    { name = "cryptography" },
+    { name = "fastembed" },
+    { name = "mcp" },
+    { name = "qdrant-client" },
+    { name = "qdrant-edge-py" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "click", specifier = ">=8.1" },
+    { name = "cryptography", specifier = ">=49.0.0" },
+    { name = "fastembed", specifier = ">=0.8.0" },
+    { name = "mcp", specifier = ">=1.28.1" },
+    { name = "qdrant-client", specifier = ">=1.18.0" },
+    { name = "qdrant-edge-py", specifier = ">=0.7.2" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "ruff", specifier = ">=0.8" },
 ]
 
 [[package]]

@@ -82,7 +82,7 @@ def _print_memory(m: Memory, score: float | None = None) -> None:
 @click.group()
 @click.option("--data-dir", envvar="ENGRAM_HOME", default=None,
               help="Memory folder (default ~/.engram).")
-@click.version_option(package_name="engram")
+@click.version_option(package_name="qdrant-engram")
 @click.pass_context
 def main(ctx: click.Context, data_dir: str | None) -> None:
     """Your memory, in a folder you own.
@@ -180,6 +180,101 @@ def recall(data_dir: str | None, query: str, k: int | None, scope: str | None,
         _print_memory(hit.memory, hit.score)
 
 
+@main.command(name="list")
+@click.option("-n", "--limit", type=int, default=20,
+              help="How many to show, newest first (0 = everything).")
+@click.option("--scope", default=None)
+@click.option("--type", "mtype", type=click.Choice([t.value for t in MemoryType]),
+              default=None)
+@click.option("--shard", default=None)
+@click.option("--all", "include_invalid", is_flag=True,
+              help="Include superseded and soft-forgotten memories.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.pass_obj
+def list_(data_dir: str | None, limit: int, scope: str | None, mtype: str | None,
+          shard: str | None, include_invalid: bool, as_json: bool) -> None:
+    """Browse everything engram knows, newest first — no query needed.
+    This is the audit view: what has been remembered about you."""
+    with _open_surface(data_dir) as store:
+        memories = store.list(
+            scope=scope, type=MemoryType(mtype) if mtype else None, shard=shard,
+            include_invalid=include_invalid, limit=limit or None,
+        )
+    if as_json:
+        click.echo(json.dumps(
+            [{"id": m.id, "text": m.text, "type": m.type.value, "scope": m.scope,
+              "tags": m.tags, "created_at": m.created_at, "valid": m.is_valid}
+             for m in memories], ensure_ascii=False, indent=2))
+        return
+    if not memories:
+        click.echo("no memories stored.")
+        return
+    for m in memories:
+        _print_memory(m)
+        if not m.is_valid:
+            click.echo(click.style("    (no longer valid)", dim=True))
+    if limit and len(memories) == limit:
+        click.echo(click.style(f"\nshowing newest {limit}; use -n 0 for everything.",
+                               dim=True))
+
+
+@main.command()
+@click.option("-n", "--limit", type=int, default=30, help="How many events.")
+@click.pass_obj
+def log(data_dir: str | None, limit: int) -> None:
+    """What the hooks did and when: recalls injected into context, session
+    captures — the transparency log for the proactive path."""
+    labels = {
+        "prompt-recall": lambda n: f"injected {n} memories into context" if n
+                                   else "fired; nothing confident enough to inject",
+        "session-start-recall": lambda n: f"surfaced {n} memories at session start"
+                                          if n else "fired; nothing relevant",
+        "auto-capture": lambda n: f"captured {n} facts from the session" if n
+                                  else "fired; nothing durable found",
+    }
+    with _open_surface(data_dir) as store:
+        events = store.recent_events(limit)
+    if not events:
+        click.echo("no hook activity yet (install with: engram hook install claude-code).")
+        return
+    for e in events:
+        describe = labels.get(e["kind"], lambda n: f"{n} hits")
+        click.echo(f"{_fmt_ts(e['ts'])}  "
+                   + click.style(f"{e['kind']:<22}", fg="cyan")
+                   + describe(e["hits"]))
+
+
+@main.command()
+@click.option("-o", "--output", type=click.Path(path_type=Path), default=None,
+              help="Where to write (default: <data-dir>/dashboard.html).")
+@click.option("--open/--no-open", "open_browser", default=True,
+              help="Open in the browser after writing.")
+@click.pass_obj
+def dashboard(data_dir: str | None, output: Path | None, open_browser: bool) -> None:
+    """Generate a local HTML dashboard: browse and search every memory,
+    see hook activity and store health. A static snapshot in your memory
+    folder — no server, nothing leaves the machine."""
+    import os
+
+    from engram.dashboard import render_dashboard
+
+    with _open_surface(data_dir) as store:
+        memories = [
+            {"id": m.id, "text": m.text, "type": m.type.value, "scope": m.scope,
+             "tags": m.tags, "created_at": m.created_at,
+             "access_count": m.access_count, "valid": m.is_valid}
+            for m in store.list(include_invalid=True)
+        ]
+        events = store.recent_events(200)
+        info = store.stats()
+    path = output or Path(_config(data_dir).data_dir) / "dashboard.html"
+    path.write_text(render_dashboard(memories, events, info))
+    os.chmod(path, 0o600)  # it contains your memories in plain text
+    click.echo(f"wrote {path} ({len(memories)} memories)")
+    if open_browser:
+        click.launch(str(path))
+
+
 @main.command()
 @click.argument("target")
 @click.option("--hard", is_flag=True,
@@ -207,18 +302,16 @@ def forget(data_dir: str | None, target: str, hard: bool, yes: bool) -> None:
 
 def _resolve_target(store: Client | MemoryStore, target: str) -> Memory | None:
     if re.fullmatch(r"[0-9a-fA-F-]{4,36}", target):
+        # An id or id prefix. This must NEVER fall through to semantic
+        # search: a hex string used as a query matches *something*, and
+        # forget --yes would purge whatever it happened to score against.
+        if isinstance(store, Client):
+            return store.get(target)  # the daemon resolves prefixes too
         try:
             uuid.UUID(target)
-            if isinstance(store, Client):
-                return store.get(target)
-            found = store.backend.retrieve([target])
-            return found[0].memory() if found else None
+            return store.get(target)
         except ValueError:
-            if isinstance(store, MemoryStore):  # prefix scan needs the shard
-                for hit in store.backend.scroll_all():
-                    if hit.id.startswith(target.lower()):
-                        return hit.memory()
-                return None
+            return store.find_by_prefix(target)
     hits = store.recall(target, k=1, reinforce=False)
     return hits[0].memory if hits else None
 
@@ -430,22 +523,15 @@ def clients() -> None:
 @click.option("--token", "with_token", is_flag=True,
               help="Require a capability token (printed once, store it in the"
                    " client's config as ENGRAM_TOKEN).")
-@click.option("--methods", default=None,
-              help="Comma-separated method grants (e.g. recall,remember)."
-                   " Default: all methods.")
 @click.pass_obj
 def clients_allow(data_dir: str | None, name: str, scopes: str,
-                  with_token: bool, methods: str | None) -> None:
+                  with_token: bool) -> None:
     """Register a client (e.g. claude-code, cursor) and grant it scopes."""
     from engram.daemon import ClientRegistry
 
     scope_list = [s.strip() for s in scopes.split(",") if s.strip()]
-    method_list = ([m.strip() for m in methods.split(",") if m.strip()]
-                   if methods else None)
-    token = ClientRegistry(_config(data_dir)).allow(
-        name, scope_list, token=with_token, methods=method_list)
-    click.echo(f"{name}: allowed scopes {', '.join(scope_list)}"
-               + (f", methods {', '.join(method_list)}" if method_list else ""))
+    token = ClientRegistry(_config(data_dir)).allow(name, scope_list, token=with_token)
+    click.echo(f"{name}: allowed scopes {', '.join(scope_list)}")
     if token:
         click.echo(click.style(f"capability token (shown once): {token}", fg="yellow"))
 
@@ -520,13 +606,12 @@ def restore(data_dir: str | None, source: Path, passphrase: str | None) -> None:
 
 
 @main.command()
-@click.option("--budget", type=int, default=50, help="Max operations this run.")
 @click.pass_obj
-def consolidate(data_dir: str | None, budget: int) -> None:
+def consolidate(data_dir: str | None) -> None:
     """Housekeeping now instead of waiting for the daemon's idle run:
     prune stale episodes, dedup, summarize old episodes into facts."""
     with _open_surface(data_dir) as store:
-        report = store.consolidate(budget=budget)
+        report = store.consolidate()
     click.echo(", ".join(f"{k} {v}" for k, v in report.items()) or "nothing to do")
 
 
@@ -551,15 +636,18 @@ def hook_session_start(data_dir: str | None, scope: str | None, k: int) -> None:
     query = f"project {cwd.name} preferences conventions decisions corrections"
     with _open_surface(data_dir) as store:
         hits = store.recall(query, k=k, scope=scope, reinforce=False)
-        journal = getattr(store, "journal", None)
-        if journal is not None:  # library mode; daemon logs server-side later
-            journal.log_event("session-start-recall", hits=len(hits))
-    if not hits:
-        return
-    click.echo(f"## Relevant long-term memories (engram, project {cwd.name})")
-    for h in hits:
-        click.echo(f"- {h.memory.text}")
-    click.echo("\n(Use the engram MCP tools to recall more or remember new facts.)")
+        store.log_event("session-start-recall", hits=len(hits))
+        pending = len(store.pending_reviews())
+    if hits:
+        click.echo(f"## Relevant long-term memories (engram, project {cwd.name})")
+        for h in hits:
+            click.echo(f"- {h.memory.text}")
+        click.echo("\n(Use the engram MCP tools to recall more or remember new facts.)")
+    if pending:
+        # Surface the review queue where the owner actually lives: the
+        # assistant relays it, instead of the queue silently accumulating.
+        click.echo(f"\n(engram: {pending} ambiguous memory conflict(s) are queued —"
+                   " suggest the user run `engram review`.)")
 
 
 @hook.command("user-prompt")
@@ -583,9 +671,7 @@ def hook_user_prompt(data_dir: str | None, scope: str | None, k: int,
     with _open_surface(data_dir) as store:
         hits = [h for h in store.recall(prompt, k=k, scope=scope, reinforce=False)
                 if h.similarity >= min_score]
-        journal = getattr(store, "journal", None)
-        if journal is not None:
-            journal.log_event("prompt-recall", hits=len(hits))
+        store.log_event("prompt-recall", hits=len(hits))
     if not hits:
         return
     click.echo("<engram-memories>")
@@ -634,9 +720,7 @@ def hook_capture(data_dir: str | None, scope: str, max_chars: int) -> None:
             return  # library mode without a model: skip, never store blobs
         actions = store.remember(tail, scope=scope, surface="auto-capture",
                                  source_ref=str(transcript_path))
-        journal = getattr(store, "journal", None)
-        if journal is not None:
-            journal.log_event("auto-capture", hits=len(actions))
+        store.log_event("auto-capture", hits=len(actions))
 
 
 @hook.command("install")
@@ -680,7 +764,23 @@ def hook_install(data_dir: str | None, surface: str, yes: bool) -> None:
     settings_path.write_text(json.dumps(settings, indent=2) + "\n")
     click.echo("installed. new sessions recall on start + every prompt, and "
                "capture on stop.")
+    _warn_if_no_model(data_dir)
     _offer_daemon(data_dir, yes)
+
+
+def _warn_if_no_model(data_dir: str | None) -> None:
+    """Capture silently no-ops without a local model; say so at install
+    time, or the user believes engram is learning when it never captures."""
+    from engram.llm import LocalLLM
+
+    cfg = _config(data_dir)
+    if LocalLLM(cfg.ollama_url, cfg.extraction_model).available():
+        return
+    click.echo(click.style(
+        f"\n⚠ no local model at {cfg.ollama_url} — recall works, but"
+        " auto-capture from sessions will be OFF.\n"
+        f"  enable it: install Ollama (https://ollama.com), then"
+        f" `ollama pull {cfg.extraction_model}`", fg="yellow"))
 
 
 def _offer_daemon(data_dir: str | None, yes: bool) -> None:
@@ -710,23 +810,6 @@ def _offer_daemon(data_dir: str | None, yes: bool) -> None:
         click.echo("skipped. start it later with: engram daemon --install")
         return
     _install_launchd(cfg)
-
-
-@hook.command("print-config")
-def hook_print_config() -> None:
-    """The snippet to put in ~/.claude/settings.json (or use hook install)."""
-    click.echo(json.dumps({
-        "hooks": {
-            "SessionStart": [{"hooks": [
-                {"type": "command", "command": "engram hook session-start"}]}],
-            "UserPromptSubmit": [{"hooks": [
-                {"type": "command", "command": "engram hook user-prompt"}]}],
-            "Stop": [{"hooks": [
-                {"type": "command", "command": "engram hook capture"}]}],
-            "PreCompact": [{"hooks": [
-                {"type": "command", "command": "engram hook capture"}]}],
-        }
-    }, indent=2))
 
 
 _RULES_TEXT = """\

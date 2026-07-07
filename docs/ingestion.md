@@ -30,16 +30,16 @@ for event in read_todays_calendar():          # your source here
     )
 ```
 
-Register the adapter once (`engram clients allow calendar --scopes work`),
-or narrow it further with a capability token and method grants:
+Register the adapter once, with a capability token so a process that
+merely knows the adapter's name can't act as it:
 
 ```bash
-engram clients allow calendar --scopes work --token --methods remember
+engram clients allow calendar --scopes work --token
 ```
 
-That last line is the least-privilege shape for ingestion: the adapter can
-write into `work` and can do nothing else — no recall, no forget, no
-export.
+The `--scopes` allowlist is the boundary that matters: the adapter reads
+and writes only inside `work`, and owner-only operations (export,
+snapshot, sync, reviews) always require the full-access `*` grant.
 
 ## Shipped and planned sources
 

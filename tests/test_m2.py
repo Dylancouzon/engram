@@ -117,13 +117,24 @@ def test_consolidate_summarizes_old_episode_clusters(config):
         store.close()
 
 
-def test_consolidate_respects_budget(config):
+def test_consolidate_cancel_skips_work_and_checkpoint(config):
+    import threading
+
+    from engram.consolidate import last_run
+
     store = make_store(config)
     try:
         for i in range(6):
             _aged(store, f"forgettable moment number {i} at place {i}", 90,
                   type=MemoryType.EPISODIC, importance=0.1)
-        report = store.consolidate(budget=3)
-        assert sum(report.values()) == 3  # bounded, resumes next run
+        stop = threading.Event()
+        stop.set()  # cancelled up front: nothing touched, no daily checkpoint
+        report = store.consolidate(stop=stop)
+        assert sum(report.values()) == 0
+        assert last_run(store) == 0.0
+        # A completed run does the work and advances the checkpoint.
+        report = store.consolidate()
+        assert report["pruned"] == 6
+        assert last_run(store) > 0.0
     finally:
         store.close()

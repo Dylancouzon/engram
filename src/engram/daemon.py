@@ -72,12 +72,10 @@ class ClientRegistry:
             return {"scopes": _IMPLICIT_CLIENTS[client]}
         return self._load().get(client)
 
-    def allow(self, client: str, scopes: list[str], token: bool = False,
-              methods: list[str] | None = None) -> str | None:
+    def allow(self, client: str, scopes: list[str], token: bool = False) -> str | None:
         """Register a client. With token=True a capability token is
         generated and its hash stored; the plaintext is returned ONCE and
-        never persisted. `methods` optionally narrows which API methods the
-        client may call (per-tool grants)."""
+        never persisted."""
         if not scopes:
             raise ValueError("scope allowlist cannot be empty (use '*' for everything)")
         import hashlib
@@ -88,8 +86,6 @@ class ClientRegistry:
         if token:
             plaintext = "egt_" + secrets.token_urlsafe(24)
             entry["token_hash"] = hashlib.sha256(plaintext.encode()).hexdigest()
-        if methods:
-            entry["methods"] = methods
         data = self._load()
         data[client] = entry
         self._write(data)
@@ -193,11 +189,6 @@ class Daemon:
             params = message.get("params") or {}
             if not isinstance(params, dict):
                 raise ProtocolError(E_BAD_REQUEST, "params must be an object")
-            granted = entry.get("methods")
-            if granted and method not in granted and method != "ping":
-                raise ProtocolError(
-                    E_SCOPE_DENIED, f"client is not granted method {method!r}"
-                )
             handler = getattr(self, f"_m_{method}", None)
             if handler is None:
                 raise ProtocolError(E_BAD_REQUEST, f"unknown method {method!r}")
@@ -266,13 +257,40 @@ class Daemon:
         return {"forgotten": forgotten is not None, "mode": params.get("mode", "soft")}
 
     def _m_get(self, params: dict, scopes: list[str], client: str) -> dict:
+        import uuid as _uuid
+
         from engram.protocol import memory_to_wire
 
-        memory = self.store.get(str(params["id"]))
+        ref = str(params["id"])
+        try:
+            _uuid.UUID(ref)
+            memory = self.store.get(ref)
+        except ValueError:
+            # A short id prefix, as the CLI prints. Edge raises on non-UUID
+            # ids, so never pass a prefix to retrieve.
+            memory = self.store.find_by_prefix(ref)
         if memory is None:
             raise ProtocolError(E_NOT_FOUND, f"no memory {params['id']}")
         _check_scope(scopes, memory.scope)
         return {"memory": memory_to_wire(memory)}
+
+    def _m_list(self, params: dict, scopes: list[str], client: str) -> dict:
+        from engram.protocol import memory_to_wire
+
+        scope = params.get("scope")
+        if scope:
+            _check_scope(scopes, scope)
+        elif "*" not in scopes:
+            scope = scopes  # the client browses only what it's allowed
+        mtype = params.get("type")
+        memories = self.store.list(
+            scope=scope,
+            type=MemoryType(mtype) if mtype else None,
+            shard=params.get("shard"),
+            include_invalid=bool(params.get("include_invalid", False)),
+            limit=params.get("limit"),
+        )
+        return {"memories": [memory_to_wire(m) for m in memories]}
 
     def _m_stats(self, params: dict, scopes: list[str], client: str) -> dict:
         _check_scope(scopes, "*")  # shard names/counts are owner information
@@ -301,7 +319,15 @@ class Daemon:
 
     def _m_consolidate(self, params: dict, scopes: list[str], client: str) -> dict:
         _check_scope(scopes, "*")
-        return self.store.consolidate(budget=int(params.get("budget", 50)))
+        return self.store.consolidate()
+
+    def _m_log_event(self, params: dict, scopes: list[str], client: str) -> dict:
+        self.store.log_event(str(params["kind"]), int(params.get("hits", 0)))
+        return {"logged": True}
+
+    def _m_events(self, params: dict, scopes: list[str], client: str) -> dict:
+        _check_scope(scopes, "*")  # trigger history is owner information
+        return {"events": self.store.recent_events(int(params.get("limit", 50)))}
 
     def _m_snapshot(self, params: dict, scopes: list[str], client: str) -> dict:
         from pathlib import Path

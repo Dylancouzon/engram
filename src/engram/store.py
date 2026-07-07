@@ -43,6 +43,20 @@ from engram.resolve import Verdict, judge
 _SHARD_NAME = re.compile(r"^(private|me-synced|shared:[a-z0-9_-]{1,32})$")
 
 
+def _dir_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+
+def _human_size(n: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024 or unit == "GiB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} GiB"
+
+
 def validate_shard(shard: str) -> str:
     """Trust-boundary shard names are a closed grammar, not free text:
     private (never syncs, default) | me-synced | shared:<group>."""
@@ -207,7 +221,6 @@ class MemoryStore:
         if shard not in self.backends:
             self.backends[shard] = EdgeBackend(
                 self.config.shard_path(shard), dense_dim=self.config.dense_dim,
-                quantize=self.config.quantize,
             )
         return self.backends[shard]
 
@@ -222,7 +235,6 @@ class MemoryStore:
                     if name not in self.backends and _SHARD_NAME.match(name):
                         self.backends[name] = EdgeBackend(
                             path, dense_dim=self.config.dense_dim,
-                            quantize=self.config.quantize,
                         )
 
     def shard_of(self, memory_id: str) -> str | None:
@@ -521,6 +533,40 @@ class MemoryStore:
                     return found[0].memory()
         return None
 
+    def find_by_prefix(self, prefix: str) -> Memory | None:
+        """Resolve a short id prefix (what the CLI prints) to its memory.
+        None when nothing — or more than one id — matches: an ambiguous
+        prefix must never silently pick one."""
+        prefix = prefix.lower()
+        matches: dict[str, Memory] = {}
+        with self._shard_guard.shared():
+            for name in sorted(self.backends, key=lambda n: n != "private"):
+                for hit in self.backends[name].scroll_all():
+                    if hit.id.startswith(prefix) and hit.id not in matches:
+                        matches[hit.id] = hit.memory()
+        return next(iter(matches.values())) if len(matches) == 1 else None
+
+    def list(self, scope: str | list[str] | None = None,
+             type: MemoryType | None = None, shard: str | None = None,
+             include_invalid: bool = False, limit: int | None = None) -> list[Memory]:
+        """Browse memories without a query, newest first — the "what do you
+        know about me" surface. Invalidated memories are excluded unless
+        asked for."""
+        flt = build_filter(
+            scope=scope,
+            type=type.value if type else None,
+            valid_at=None if include_invalid else now_ts(),
+        )
+        shards = [shard] if shard else sorted(self.backends, key=lambda n: n != "private")
+        memories: dict[str, Memory] = {}
+        with self._shard_guard.shared():
+            for name in shards:
+                for hit in self._backend(name).scroll_all(flt=flt):
+                    if hit.id not in memories:
+                        memories[hit.id] = hit.memory()
+        out = sorted(memories.values(), key=lambda m: m.created_at, reverse=True)
+        return out[:limit] if limit else out
+
     def _reinforce(self, memory_ids: list[str]) -> None:
         if self._reinforce_mode == "buffered":
             with self._reinforce_queue_lock:
@@ -615,8 +661,7 @@ class MemoryStore:
             shard_dir = self.config.shard_path(shard)
             trash = shard_dir.with_name(shard_dir.name + ".purging")
             shard_dir.rename(trash)
-            new_backend = EdgeBackend(shard_dir, dense_dim=self.config.dense_dim,
-                                      quantize=self.config.quantize)
+            new_backend = EdgeBackend(shard_dir, dense_dim=self.config.dense_dim)
             self.backends[shard] = new_backend
             for point_id, vector, payload in survivors:
                 new_backend.upsert_raw(point_id, vector, payload)
@@ -724,10 +769,10 @@ class MemoryStore:
             self.journal.checkpoint()
             return write_snapshot(self.config, dest, passphrase)
 
-    def consolidate(self, budget: int = 50, stop=None) -> dict[str, int]:
+    def consolidate(self, stop=None) -> dict[str, int]:
         from engram.consolidate import consolidate
 
-        return consolidate(self, budget=budget, stop=stop)
+        return consolidate(self, stop=stop)
 
     # -- maintenance ---------------------------------------------------------------
 
@@ -766,6 +811,17 @@ class MemoryStore:
         self.journal.mark_flushed(self._applied_seq)
         return applied
 
+    def log_event(self, kind: str, hits: int = 0) -> None:
+        """Record a proactive-trigger firing (hook recall/capture)."""
+        self.journal.log_event(kind, hits)
+
+    def recent_events(self, limit: int = 50) -> list[dict]:
+        """Newest trigger firings first — what the hooks did and when."""
+        return [
+            {"kind": kind, "ts": ts, "hits": hits}
+            for kind, ts, hits in self.journal.recent_events(limit)
+        ]
+
     def stats(self) -> dict:
         info: dict = {
             "points": sum(b.count() for b in self.backends.values()),
@@ -773,7 +829,12 @@ class MemoryStore:
             "journal_entries": self.journal.row_count,
             "flushed_seq": self.journal.flushed_seq,
             "tombstones": len(self.journal.tombstones()),
+            "pending_reviews": len(self.pending_reviews()),
             "data_dir": str(self.config.data_dir),
+            "disk": {
+                "data": _human_size(_dir_size(self.config.data_dir)),
+                "models_cache": _human_size(_dir_size(self.config.models_dir)),
+            },
             "dense_model": DENSE_MODEL,
             "extraction": "ollama" if self.llm and self.llm.available()
                           else "verbatim fallback",
