@@ -8,10 +8,20 @@ as source_text for audit and future re-extraction.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from engram.llm import LocalLLM
 from engram.models import MemoryType
+
+# Unicode word runs of 3+ chars, so grounding works for non-Latin scripts too
+# (Cyrillic, Greek, ...). Coarse for scripts without word spacing (CJK), but
+# the failure mode there is a safe fall back to verbatim, never a wrong store.
+_WORD = re.compile(r"\w{3,}")
+
+
+def _content_tokens(text: str) -> set[str]:
+    return set(_WORD.findall(text.lower()))
 
 _SYSTEM = """You extract long-term memories from text for a personal memory system.
 
@@ -37,7 +47,7 @@ class ExtractedFact:
     type: MemoryType = MemoryType.SEMANTIC
     importance: float = 0.5
     tags: list[str] = field(default_factory=list)
-    verbatim: bool = False  # True when extraction didn't run
+    verbatim: bool = False  # raw text stored as-is: no model, or ungrounded output
 
 
 def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> list[ExtractedFact]:
@@ -73,4 +83,19 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
         tags = [str(t).lower() for t in item.get("tags", []) if t][:3]
         facts.append(ExtractedFact(text=str(item["text"]).strip(), type=mtype,
                                    importance=importance, tags=tags))
+
+    if not facts:
+        return facts
+    # Fabrication guard: a weak local model handed contentless or degenerate
+    # input can ignore it and emit an unrelated invented memory. If the
+    # extraction as a WHOLE shares no content token with the input, it isn't
+    # grounded in what the user said, so store the raw text verbatim instead of
+    # persisting an invention. Checked across the whole extraction, never
+    # per-fact: a legitimate multi-fact split can rephrase one fact past a
+    # word-level match, and dropping it would bury that fact in a sibling's
+    # source_text.
+    src = _content_tokens(text)
+    produced = set().union(*(_content_tokens(f.text) for f in facts))
+    if not (src & produced):
+        return [ExtractedFact(text=text.strip(), verbatim=True)]
     return facts

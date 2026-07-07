@@ -30,9 +30,49 @@ def test_bare_object_envelope():
 
 
 def test_bare_list_envelope():
-    llm = EnvelopeLLM([{"text": "a fact", "type": "episodic", "importance": 0.5}])
-    [fact] = extract("stuff", llm)
+    llm = EnvelopeLLM([{"text": "the demo is tomorrow", "type": "episodic",
+                        "importance": 0.5}])
+    [fact] = extract("the demo is tomorrow", llm)
     assert fact.type is MemoryType.EPISODIC
+
+
+def test_ungrounded_extraction_falls_back_to_verbatim():
+    # A weak model can invent a fact unrelated to the input. If the extraction
+    # shares no content token with the source, store the raw text instead.
+    llm = EnvelopeLLM({"memories": [
+        {"text": "Dylan decided to learn Python", "importance": 0.7}]})
+    [fact] = extract("test fact", llm)
+    assert fact.verbatim and fact.text == "test fact"
+
+
+def test_grounded_extraction_survives():
+    llm = EnvelopeLLM({"memories": [
+        {"text": "Dylan's cat is named Miso", "importance": 0.7}]})
+    [fact] = extract("his cat is Miso", llm)
+    assert not fact.verbatim and fact.text == "Dylan's cat is named Miso"
+
+
+def test_grounding_is_whole_extraction_not_per_fact():
+    # A legitimate multi-fact split can rephrase one fact past a word-level
+    # match ("prefer" vs "prefers", "JS" too short). As long as the extraction
+    # as a whole is grounded, no individual fact is dropped — else the lost
+    # fact would be buried in a sibling's source_text.
+    llm = EnvelopeLLM({"memories": [
+        {"text": "Dylan prefers JavaScript", "importance": 0.6},
+        {"text": "Dylan's dog is named Miso", "importance": 0.6}]})
+    facts = extract("I prefer JS; my dog is Miso", llm)
+    assert {f.text for f in facts} == {
+        "Dylan prefers JavaScript", "Dylan's dog is named Miso"}
+    assert not any(f.verbatim for f in facts)
+
+
+def test_contentless_input_cannot_smuggle_a_fabrication():
+    # Input with no content tokens can't ground anything: a model that invents
+    # an unrelated fact must not have it accepted — fall back to verbatim.
+    llm = EnvelopeLLM({"memories": [
+        {"text": "Dylan decided to learn Python", "importance": 0.7}]})
+    [fact] = extract("ok", llm)
+    assert fact.verbatim and fact.text == "ok"
 
 
 def test_garbage_falls_back_to_verbatim():
@@ -50,7 +90,7 @@ def test_salience_floor_drops_trivia():
         {"text": "important thing", "importance": 0.8},
         {"text": "filler", "importance": 0.05},
     ]})
-    facts = extract("...", llm, salience_floor=0.1)
+    facts = extract("the important thing plus some filler", llm, salience_floor=0.1)
     assert [f.text for f in facts] == ["important thing"]
 
 
