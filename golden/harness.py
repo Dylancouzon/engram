@@ -37,7 +37,7 @@ def run_case(case: dict, base_dir: Path, verbose: bool) -> dict:
     try:
         # Seed fixture memories without judging them against each other.
         original_resolve = store._resolve_conflict
-        store._resolve_conflict = lambda fact, scope: Verdict(Op.ADD, None, 1.0)
+        store._resolve_conflict = lambda *args, **kwargs: Verdict(Op.ADD, None, 1.0)
         for text in case["existing"]:
             store.remember(text)
         store._resolve_conflict = original_resolve

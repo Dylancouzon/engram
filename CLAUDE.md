@@ -31,12 +31,20 @@ touching `backend/edge.py`; the .pyi stub lies about some defaults.
 
 ## Layout
 
-`src/engram/`: `store.py` (pipelines, write lock, buffered reinforce) ·
-`journal.py` (source of truth) · `backend/edge.py` (shard) · `embed.py`
-(nomic + miniCOIL via FastEmbed) · `extract.py`/`resolve.py`/`llm.py`
-(local model) · `redact.py` (stage-0) · `protocol.py` (versioned local API,
-line-JSON over Unix socket) · `daemon.py` (shard owner; client registry =
-clients.json, default-deny except cli) · `client.py` (thin client, daemon
-auto-spawn) · `mcp_server.py` (FastMCP stdio) · `cli.py` (daemon-first,
-library fallback) · `models.py`/`config.py`. Tests inject
-`FakeEmbedder`/`FakeLLM` (`tests/conftest.py`) — no model downloads in CI.
+`src/engram/`: `store.py` (pipelines, multi-shard routing, write lock,
+shard guard, buffered reinforce, review queue) · `journal.py` (source of
+truth; shard column, events, meta) · `backend/edge.py` (per-shard Edge) ·
+`embed.py` (nomic + miniCOIL) · `extract.py`/`resolve.py`/`llm.py` (local
+model) · `redact.py` (stage-0) · `protocol.py` (local API v1) · `daemon.py`
+(owner; registry = clients.json w/ tokens + method grants; idle
+consolidation) · `client.py` · `mcp_server.py` · `consolidate.py` (prune/
+dedup/summarize) · `archive.py` (encrypted snapshot/restore) · `sync.py`
+(encrypted relay sync, LWW, tombstones; private never syncs) · `cli.py` ·
+`models.py`/`config.py`. Tests inject `FakeEmbedder`/`FakeLLM`
+(`tests/conftest.py`); sync tests use QdrantClient(":memory:") as the relay.
+
+Key invariants beyond M0: shard names are a closed grammar
+(private/me-synced/shared:<group>); pulled sync rows journal as "sync-pull"
+(never re-pushed); recall fans out per shard, normalizes, private wins id
+ties; Edge Formula can't see fused scores (probed) so rescoring is app-side
+by design; MMR composes with hybrid prefetches and is on by default.
