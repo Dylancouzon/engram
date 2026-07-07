@@ -31,10 +31,14 @@ Rules:
 - Only extract things worth remembering long-term: stable facts, preferences,
   decisions, corrections, lessons learned, important events. Skip filler,
   transient state, and anything that will be obviously stale in a week.
+- If the message is only a question or a request to do something, with no
+  durable fact stated, return {"memories": []}. If it also states a durable
+  fact, extract just that fact.
 - type: "semantic" for facts/preferences/decisions, "episodic" for dated
   events ("X happened on/when ..."), "procedural" for how-tos and workflows.
-- importance: 0.0-1.0. Corrections and explicit "remember this" -> 0.8+.
-  Casual details -> 0.3-0.5. Trivia/filler -> below 0.2.
+- importance: calibrate, do not inflate. MOST facts are 0.3-0.5. Use 0.6-0.7
+  for a clear standing preference or decision. Reserve 0.8+ for an explicit
+  correction or "remember this". Minor detail -> below 0.3.
 - tags: 1-3 short lowercase topic tags.
 
 Respond with JSON: {"memories": [{"text": ..., "type": ..., "importance": ..., "tags": [...]}]}

@@ -197,6 +197,35 @@
       "expect_op": "SUPERSEDE",
       "recall_query": "how does Dylan take his coffee",
       "expect_recalled": "black"
+    },
+
+    {
+      "name": "meta-pure-question",
+      "existing": [],
+      "input": "How do I activate this and what's the best way to dogfood it?",
+      "expect_op": "(salience-dropped)"
+    },
+    {
+      "name": "meta-request-no-fact",
+      "existing": [],
+      "input": "Can you run a few experiments to test how the categorization works?",
+      "expect_op": "(salience-dropped)"
+    },
+    {
+      "name": "guard-decision-inside-request",
+      "existing": [],
+      "input": "I decided to pin the project to Python 3.13 for the Edge wheels, can you update the config for me?",
+      "expect_op": "ADD",
+      "recall_query": "which Python version does the project use",
+      "expect_recalled": "3.13"
+    },
+    {
+      "name": "guard-preference-inside-question",
+      "existing": [],
+      "input": "Why are you using pip? I always use uv for Python, please switch to it",
+      "expect_op": "ADD",
+      "recall_query": "what does Dylan use for Python packaging",
+      "expect_recalled": "uv"
     }
   ]
 }

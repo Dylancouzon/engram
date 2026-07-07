@@ -680,6 +680,35 @@ def hook_user_prompt(data_dir: str | None, scope: str | None, k: int,
     click.echo("</engram-memories>")
 
 
+# The user's real input carries promptSource "typed" (or "queued"/
+# "suggestion_accepted"). Claude Code also injects skill bodies, hook notices,
+# and reference text as user-role turns carrying "system"/"sdk"/absent; those
+# were being stored as "memories" (e.g. the skill definition itself).
+_USER_ENTERED = ("typed", "queued", "suggestion_accepted")
+
+
+def _transcript_tail(transcript_path: str, max_chars: int) -> str:
+    """The tail of what the user actually entered, injected turns removed."""
+    texts: list[str] = []
+    for line in Path(transcript_path).read_text(errors="replace").splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        message = entry.get("message") or {}
+        if message.get("role") != "user":
+            continue  # the user's words carry the facts worth keeping
+        if entry.get("promptSource") not in _USER_ENTERED:
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text")
+    return "\n".join(t for t in texts if t and not t.startswith("<"))[-max_chars:]
+
+
 @hook.command("capture")
 @click.option("--scope", default="default")
 @click.option("--max-chars", type=int, default=8000)
@@ -696,22 +725,7 @@ def hook_capture(data_dir: str | None, scope: str, max_chars: int) -> None:
     transcript_path = payload.get("transcript_path")
     if not transcript_path or not Path(transcript_path).exists():
         return
-    texts: list[str] = []
-    for line in Path(transcript_path).read_text(errors="replace").splitlines():
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        message = entry.get("message") or {}
-        if message.get("role") != "user":
-            continue  # the user's words carry the facts worth keeping
-        content = message.get("content")
-        if isinstance(content, str):
-            texts.append(content)
-        elif isinstance(content, list):
-            texts.extend(b.get("text", "") for b in content
-                         if isinstance(b, dict) and b.get("type") == "text")
-    tail = "\n".join(t for t in texts if t and not t.startswith("<"))[-max_chars:]
+    tail = _transcript_tail(transcript_path, max_chars)
     if len(tail) < 40:
         return
     with _open_surface(data_dir) as store:
