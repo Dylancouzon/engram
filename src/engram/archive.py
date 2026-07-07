@@ -73,10 +73,10 @@ def read_snapshot(source: Path, passphrase: str | None) -> io.BytesIO:
 
 def restore_snapshot(config: Config, source: Path, passphrase: str | None) -> None:
     """Unpack a snapshot into an empty memory folder."""
-    if config.journal_path.exists():
+    if config.data_dir.exists() and any(config.data_dir.iterdir()):
         raise ValueError(
-            f"{config.data_dir} already contains a memory; restore into a fresh"
-            " folder (or move the old one aside)"
+            f"{config.data_dir} is not empty; restore into a fresh folder"
+            " (or move the old one aside)"
         )
     config.data_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(config.data_dir, 0o700)

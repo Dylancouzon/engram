@@ -108,6 +108,87 @@ def test_private_shard_refuses_sync_config(config):
                                        collection="c"))
 
 
+def test_hand_edited_private_target_refused_on_load(config):
+    # A corrupt/manual sync.json naming private must not open a sync path.
+    (config.data_dir).mkdir(parents=True, exist_ok=True)
+    (config.data_dir / "sync.json").write_text(
+        '{"private": {"url": "x", "api_key": null, "collection": "c"}}')
+    from engram.sync import load_targets
+    with pytest.raises(SyncError):
+        load_targets(config)
+
+
+def test_relay_cannot_forge_a_tombstone(tmp_path, cloud):
+    from qdrant_client import models as qm
+    a = _device(tmp_path, "device-a")
+    try:
+        [act] = a.remember("Dylan's cat is named Miso", shard="me-synced")
+        sync_shard(a, "me-synced", client=cloud)
+        # Attacker injects a tombstone for a real id with no valid MAC.
+        cloud.upsert("engram-me-synced", points=[qm.PointStruct(
+            id=act.memory.id, vector={"relay": [0.0]},
+            payload={"op": "tombstone", "ts": 9e9, "device": "evil"})])
+        report = sync_shard(a, "me-synced", client=cloud)
+        assert report["tombstoned"] == 0  # forgery rejected
+        assert a.get(act.memory.id) is not None  # memory survives
+    finally:
+        a.close()
+
+
+def test_relay_cannot_swap_blob_between_ids(tmp_path, cloud):
+    a = _device(tmp_path, "device-a")
+    b = _device(tmp_path, "device-b", key_from=a.config)
+    try:
+        [act] = a.remember("Dylan's cat is named Miso", shard="me-synced")
+        sync_shard(a, "me-synced", client=cloud)
+        # Take A's legit ciphertext and re-file it under a different id.
+        records, _ = cloud.scroll("engram-me-synced", limit=10, with_payload=True)
+        blob = next(r.payload["blob"] for r in records
+                    if r.payload.get("op") == "upsert")
+        from qdrant_client import models as qm
+        cloud.upsert("engram-me-synced", points=[qm.PointStruct(
+            id="00000000-0000-4000-8000-000000000999",
+            vector={"relay": [0.0]},
+            payload={"op": "upsert", "blob": blob, "ts": 9e9, "device": "evil"})])
+        report = sync_shard(b, "me-synced", client=cloud)
+        # B applies the genuine point but rejects the swapped one (id mismatch
+        # inside the authenticated blob).
+        assert b.get(act.memory.id) is not None
+        assert b.get("00000000-0000-4000-8000-000000000999") is None
+    finally:
+        a.close()
+        b.close()
+
+
+def test_unknown_tombstone_is_recorded(tmp_path, cloud):
+    a = _device(tmp_path, "device-a")
+    b = _device(tmp_path, "device-b", key_from=a.config)
+    try:
+        [act] = a.remember("ephemeral note", shard="me-synced")
+        a.forget(act.memory.id, mode="hard")  # tombstone before B ever syncs
+        sync_shard(a, "me-synced", client=cloud)
+        # B sees only the tombstone (never had the upsert).
+        sync_shard(b, "me-synced", client=cloud)
+        assert b.journal.is_tombstoned(act.memory.id)
+        # A later replayed upsert cannot resurrect it on B.
+        import json as _json
+
+        from cryptography.fernet import Fernet
+        from qdrant_client import models as qm
+        key = (a.config.data_dir / "sync.key").read_bytes().strip()
+        blob = Fernet(key).encrypt(_json.dumps(
+            {"id": act.memory.id, "ts": 1.0, "shard": "me-synced",
+             "payload": {"text": "ephemeral note"}}).encode()).decode()
+        cloud.upsert("engram-me-synced", points=[qm.PointStruct(
+            id=act.memory.id, vector={"relay": [0.0]},
+            payload={"op": "upsert", "blob": blob, "ts": 1.0, "device": "old"})])
+        sync_shard(b, "me-synced", client=cloud)
+        assert b.get(act.memory.id) is None  # suppressed
+    finally:
+        a.close()
+        b.close()
+
+
 def test_lww_prefers_newer_write(tmp_path, cloud):
     a = _device(tmp_path, "device-a")
     b = _device(tmp_path, "device-b", key_from=a.config)

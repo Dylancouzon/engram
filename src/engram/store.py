@@ -130,6 +130,7 @@ class ReviewItem:
     target: Memory
     confidence: float
     merged_text: str | None = None
+    shard: str = "private"
 
 
 class MemoryStore:
@@ -485,21 +486,11 @@ class MemoryStore:
                     emb, k=k * 3, flt=flt, prefetch_limit=self.config.prefetch_limit,
                     mmr_lambda=self.config.mmr_lambda,
                 )
+                # Every shard uses the same embedding model, so raw scores ARE
+                # comparable across shards; normalizing per shard would let a
+                # weak shard's best hit outrank a strong shard's real match.
                 for h in shard_hits:
-                    h.raw = h.score  # keep the absolute scale for thresholds
-                if len(shard_hits) >= 3:
-                    # Enough hits for min-max to mean something.
-                    lo = min(h.score for h in shard_hits)
-                    hi = max(h.score for h in shard_hits)
-                    span = (hi - lo) or 1.0
-                    for h in shard_hits:
-                        h.score = 0.5 if hi == lo else (h.score - lo) / span
-                else:
-                    # Degenerate result sets keep their raw score (clipped):
-                    # a lone weak match must not inflate to parity with a
-                    # lone strong one from another shard.
-                    for h in shard_hits:
-                        h.score = max(0.0, min(1.0, h.score))
+                    h.raw = h.score
                 seen_ids = {h.id for h in hits}
                 hits.extend(h for h in shard_hits if h.id not in seen_ids)
 
@@ -607,7 +598,7 @@ class MemoryStore:
         #   3. shard purge-rebuild — surviving points move verbatim
         #                           (vectors preserved, no re-embed)
         self._purge_marker.touch()
-        self.journal.hard_forget(memory_id)
+        self.journal.hard_forget(memory_id, shard=owner_shard)
         self._purge_shard(exclude={memory_id}, shard=owner_shard)
         self._purge_marker.unlink()
         return memory
@@ -658,6 +649,7 @@ class MemoryStore:
                 target=target,
                 confidence=e.payload.get("confidence", 0.0),
                 merged_text=e.payload.get("merged_text"),
+                shard=e.shard,
             ))
         return items
 
@@ -674,7 +666,7 @@ class MemoryStore:
                 old = item.target
                 old.valid_to = now_ts()
                 old.superseded_by = item.new.id
-                self._commit_upserts([old])
+                self._commit_upserts([old], item.shard)
             elif accept and item.proposed_op is Op.UPDATE:
                 target = item.target
                 target.text = item.merged_text or item.new.text
@@ -682,10 +674,11 @@ class MemoryStore:
                 target.tags = list(dict.fromkeys(target.tags + item.new.tags))
                 # The ADDed twin folds into the target: journal the delete so
                 # a rebuild converges to the same state.
-                delete_seq = self.journal.append("delete", item.new.id)
-                self.backend.delete([item.new.id])
+                delete_seq = self.journal.append("delete", item.new.id,
+                                                 shard=item.shard)
+                self._backend(item.shard).delete([item.new.id])
                 self._applied_seq = max(self._applied_seq, delete_seq)
-                self._commit_upserts([target])
+                self._commit_upserts([target], item.shard)
             resolved_seq = self.journal.append(
                 "review_resolved", item.new.id,
                 {"review_seq": seq, "accepted": accept},
@@ -694,19 +687,24 @@ class MemoryStore:
             self.journal.mark_flushed(resolved_seq)
             return item
 
-    def apply_synced(self, memory: Memory, shard: str, remote_ts: float) -> None:
-        """Apply a memory pulled from a sync relay. Journaled as 'sync-pull'
-        so push never re-uploads it (no cross-device ping-pong); replay and
-        rebuild treat it exactly like an upsert."""
+    def apply_synced(self, memory: Memory, shard: str, remote_ts: float) -> bool:
+        """Apply a memory pulled from a sync relay, unless local state is
+        already as new (checked HERE, under the write lock, so a local write
+        racing the pull can't be clobbered by older remote state). Journaled
+        as 'sync-pull' with the ORIGIN timestamp: push never re-uploads it,
+        and future LWW comparisons use origin time, not arrival time."""
         with self._write_lock:
+            if self.journal.last_ts_for(memory.id) >= remote_ts:
+                return False
             backend = self._backend(shard)
             seq = self.journal.append("sync-pull", memory.id, memory.to_payload(),
-                                      shard=shard)
+                                      shard=shard, ts=remote_ts)
             emb = self.embedder.embed_documents([memory.text])[0]
             backend.upsert(memory, emb)
             self._applied_seq = max(self._applied_seq, seq)
             backend.flush()
             self.journal.mark_flushed(self._applied_seq)
+            return True
 
     # -- backup / housekeeping ---------------------------------------------------
 
@@ -719,6 +717,9 @@ class MemoryStore:
             for backend in self.backends.values():
                 backend.flush()
             self.journal.mark_flushed(self._applied_seq)
+            # Fold the SQLite WAL into journal.db, or the tar captures a
+            # stale source of truth.
+            self.journal.checkpoint()
             return write_snapshot(self.config, dest, passphrase)
 
     def consolidate(self, budget: int = 50, stop=None) -> dict[str, int]:

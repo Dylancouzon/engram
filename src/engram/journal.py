@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS journal (
 CREATE INDEX IF NOT EXISTS journal_memory_id ON journal (memory_id);
 CREATE TABLE IF NOT EXISTS tombstones (
     memory_id TEXT PRIMARY KEY,
-    ts REAL NOT NULL
+    ts REAL NOT NULL,
+    shard TEXT NOT NULL DEFAULT 'private'
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -96,6 +97,13 @@ class Journal:
             self._conn.execute(
                 "ALTER TABLE journal ADD COLUMN shard TEXT NOT NULL DEFAULT 'private'"
             )
+        tcols = {r[1] for r in self._conn.execute("PRAGMA table_info(tombstones)")}
+        if "shard" not in tcols:
+            # Default 'private' is the safe direction: legacy tombstones are
+            # never pushed to a relay.
+            self._conn.execute(
+                "ALTER TABLE tombstones ADD COLUMN shard TEXT NOT NULL DEFAULT 'private'"
+            )
         self._conn.commit()
 
     # -- append (the ack point) -------------------------------------------
@@ -107,15 +115,20 @@ class Journal:
         payload: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         shard: str = "private",
+        ts: float | None = None,
     ) -> int:
         """Durably record one write intent. Returns its seq.
-        A duplicate idempotency_key returns the existing seq (retry-safe)."""
-        return self.append_many([(op, memory_id, payload, idempotency_key)], shard=shard)[-1]
+        A duplicate idempotency_key returns the existing seq (retry-safe).
+        `ts` defaults to now; sync passes the origin timestamp so LWW clocks
+        stay stable across devices."""
+        return self.append_many([(op, memory_id, payload, idempotency_key)],
+                                shard=shard, ts=ts)[-1]
 
     def append_many(
         self,
         intents: list[tuple[str, str, dict[str, Any] | None, str | None]],
         shard: str = "private",
+        ts: float | None = None,
     ) -> list[int]:
         """Atomically record several intents (e.g. supersede = 2 upserts)."""
         seqs: list[int] = []
@@ -133,7 +146,7 @@ class Journal:
                     " VALUES (?, ?, ?, ?, ?, ?)",
                     (op, memory_id, key,
                      json.dumps(payload, ensure_ascii=False) if payload is not None else None,
-                     time.time(), shard),
+                     ts if ts is not None else time.time(), shard),
                 )
                 seqs.append(cur.lastrowid)
         return seqs
@@ -172,18 +185,37 @@ class Journal:
 
     # -- forgetting ---------------------------------------------------------
 
-    def hard_forget(self, memory_id: str) -> None:
+    def hard_forget(self, memory_id: str, shard: str = "private") -> None:
         """Purge every trace of a memory from the log, then VACUUM so the
         content doesn't survive in free pages. Leaves a content-free
-        tombstone that suppresses the id."""
+        tombstone (tagged with its shard, so sync knows where it may
+        propagate) that suppresses the id."""
         with self._lock:
             with self._conn:
                 self._conn.execute("DELETE FROM journal WHERE memory_id = ?", (memory_id,))
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO tombstones (memory_id, ts) VALUES (?, ?)",
-                    (memory_id, time.time()),
+                    "INSERT OR REPLACE INTO tombstones (memory_id, ts, shard)"
+                    " VALUES (?, ?, ?)",
+                    (memory_id, time.time(), shard),
                 )
             self._conn.execute("VACUUM")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def add_tombstone(self, memory_id: str, shard: str) -> None:
+        """Record a tombstone for an id we never held (pulled from sync):
+        suppresses any future resurrection, without the VACUUM a local
+        hard-forget pays."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO tombstones (memory_id, ts, shard)"
+                " VALUES (?, ?, ?)",
+                (memory_id, time.time(), shard),
+            )
+
+    def checkpoint(self) -> None:
+        """Fold the SQLite WAL into the main db file — required before a
+        snapshot copies journal.db, or the backup misses recent writes."""
+        with self._lock:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def is_tombstoned(self, memory_id: str) -> bool:
@@ -195,9 +227,15 @@ class Journal:
                 is not None
             )
 
-    def tombstones(self) -> set[str]:
+    def tombstones(self, shard: str | None = None) -> set[str]:
         with self._lock:
-            return {r[0] for r in self._conn.execute("SELECT memory_id FROM tombstones")}
+            if shard is None:
+                rows = self._conn.execute("SELECT memory_id FROM tombstones")
+            else:
+                rows = self._conn.execute(
+                    "SELECT memory_id FROM tombstones WHERE shard = ?", (shard,)
+                )
+            return {r[0] for r in rows}
 
     def last_ts_for(self, memory_id: str) -> float:
         """Most recent journal activity for an id — the LWW clock for sync."""

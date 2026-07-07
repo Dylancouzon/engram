@@ -53,6 +53,12 @@ def consolidate(
     """One bounded consolidation run. Returns per-pass counts."""
     report = {"pruned": 0, "deduped": 0, "summarized": 0}
     now = now_ts()
+    # Memories awaiting an owner decision are off-limits: consolidation must
+    # not invalidate a review's target or its ADDed twin out from under it.
+    protected: set[str] = set()
+    for item in store.pending_reviews():
+        protected.add(item.new.id)
+        protected.add(item.target.id)
 
     def cancelled() -> bool:
         return stop is not None and stop.is_set()
@@ -76,6 +82,8 @@ def consolidate(
                     break
                 if m.type is not MemoryType.EPISODIC or m.access_count > 0:
                     continue
+                if m.id in protected:
+                    continue
                 age_days = (now - m.created_at) / 86400.0
                 if age_days < PRUNE_MIN_AGE_DAYS:
                     continue
@@ -93,7 +101,7 @@ def consolidate(
             for m in sorted(valid, key=lambda m: m.created_at):
                 if cancelled() or spent() >= budget:
                     break
-                if not m.is_valid:
+                if not m.is_valid or m.id in protected:
                     continue
                 key = _normalize(m.text)
                 prior = seen.get(key)
@@ -117,8 +125,12 @@ def consolidate(
                 for (scope, _tag), episodes in groups.items():
                     if cancelled() or spent() >= budget:
                         break
-                    episodes = [e for e in episodes if e.is_valid]
+                    episodes = [e for e in episodes
+                                if e.is_valid and e.id not in protected]
                     if len(episodes) < SUMMARIZE_MIN_GROUP:
+                        continue
+                    # A group costs what it touches, not one budget unit.
+                    if spent() + len(episodes) + 1 > budget:
                         continue
                     listing = "\n".join(
                         f"- ({time.strftime('%Y-%m-%d', time.localtime(e.created_at))}) "
@@ -148,7 +160,10 @@ def consolidate(
                     report["summarized"] += 1
 
     store.journal.mark_flushed(store._applied_seq)
-    store.journal.set_meta("consolidated_at", str(now))
+    if not cancelled() and spent() < budget:
+        # Only a COMPLETED run advances the daily checkpoint; an exhausted or
+        # cancelled run should resume at the next idle window instead.
+        store.journal.set_meta("consolidated_at", str(now))
     return report
 
 

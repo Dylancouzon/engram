@@ -20,6 +20,8 @@ supports against a standard collection, no server cooperation needed.
 
 from __future__ import annotations
 
+import hashlib
+import hmac as hmac_mod
 import json
 import uuid
 from dataclasses import dataclass
@@ -53,13 +55,24 @@ def _sync_config_path(config: Config):
 
 
 def load_targets(config: Config) -> dict[str, SyncTarget]:
+    """Targets are re-validated on every load: a hand-edited or corrupted
+    sync.json must never be able to give the private shard a sync path."""
+    from engram.store import validate_shard
+
     path = _sync_config_path(config)
     if not path.exists():
         return {}
     raw = json.loads(path.read_text())
-    return {
-        shard: SyncTarget(shard=shard, **entry) for shard, entry in raw.items()
-    }
+    targets: dict[str, SyncTarget] = {}
+    for shard, entry in raw.items():
+        validate_shard(shard)
+        if shard == "private":
+            raise SyncError(
+                "sync.json names the private shard — refusing to sync anything"
+                " until that entry is removed"
+            )
+        targets[shard] = SyncTarget(shard=shard, **entry)
+    return targets
 
 
 def save_target(config: Config, target: SyncTarget) -> None:
@@ -79,16 +92,27 @@ def save_target(config: Config, target: SyncTarget) -> None:
     os.chmod(path, 0o600)
 
 
-def sync_key(config: Config) -> Fernet:
-    """The local encryption key: generated once, copied between devices by
-    the owner, never uploaded."""
+def _key_bytes(config: Config) -> bytes:
     import os
 
     path = config.data_dir / "sync.key"
     if not path.exists():
         path.write_bytes(Fernet.generate_key())
         os.chmod(path, 0o600)
-    return Fernet(path.read_bytes().strip())
+    return path.read_bytes().strip()
+
+
+def sync_key(config: Config) -> Fernet:
+    """The local encryption key: generated once, copied between devices by
+    the owner, never uploaded."""
+    return Fernet(_key_bytes(config))
+
+
+def _tombstone_mac(key: bytes, memory_id: str) -> str:
+    """Tombstones are content-free, so they can't carry ciphertext — they
+    carry a MAC instead. A relay that can't produce this can't forge
+    deletions."""
+    return hmac_mod.new(key, f"tombstone:{memory_id}".encode(), hashlib.sha256).hexdigest()
 
 
 def device_id(config: Config) -> str:
@@ -105,6 +129,7 @@ class ShardSync:
         self.store = store
         self.target = target
         self.fernet = sync_key(store.config)
+        self._mac_key = _key_bytes(store.config)
         self.device = device_id(store.config)
         self.client = client or QdrantClient(url=target.url, api_key=target.api_key)
         self._ensure_collection()
@@ -136,9 +161,14 @@ class ShardSync:
                 continue
             top = max(top, entry.seq)
             if entry.op == "upsert" and entry.payload is not None:
-                blob = self.fernet.encrypt(
-                    json.dumps(entry.payload, ensure_ascii=False).encode()
-                ).decode()
+                # id, ts and shard live INSIDE the ciphertext: a relay that
+                # swaps blobs between ids, replays old timestamps, or moves a
+                # point across collections fails verification on pull.
+                blob = self.fernet.encrypt(json.dumps(
+                    {"id": entry.memory_id, "ts": entry.ts,
+                     "shard": self.target.shard, "payload": entry.payload},
+                    ensure_ascii=False,
+                ).encode()).decode()
                 points.append(qm.PointStruct(
                     id=entry.memory_id,
                     vector={VECTOR_NAME: [0.0]},
@@ -148,10 +178,17 @@ class ShardSync:
             elif entry.op == "delete":
                 points.append(self._tombstone_point(entry.memory_id, entry.ts))
 
-        # Tombstones are content-free and idempotent: always propagate, so a
-        # hard forget overwrites any ciphertext still sitting in the relay.
-        for mid in self.store.journal.tombstones():
+        # Tombstones for THIS shard are content-free and idempotent: always
+        # propagate, so a hard forget overwrites any ciphertext still in the
+        # relay. Private tombstones never reach any relay (shard filter).
+        tombstoned = self.store.journal.tombstones(shard=self.target.shard)
+        for mid in tombstoned:
             points.append(self._tombstone_point(mid, None))
+
+        # A hard-forget that raced this scan must not re-upload ciphertext.
+        points = [pt for pt in points
+                  if pt.payload.get("op") == "tombstone"
+                  or str(pt.id) not in tombstoned]
 
         if points:
             # Last write per id wins within the batch (upsert order).
@@ -167,7 +204,8 @@ class ShardSync:
         return qm.PointStruct(
             id=memory_id,
             vector={VECTOR_NAME: [0.0]},
-            payload={"op": "tombstone", "ts": ts or now_ts(), "device": self.device},
+            payload={"op": "tombstone", "ts": ts or now_ts(), "device": self.device,
+                     "mac": _tombstone_mac(self._mac_key, memory_id)},
         )
 
     # -- pull ---------------------------------------------------------------------
@@ -190,14 +228,23 @@ class ShardSync:
 
     def _merge_one(self, memory_id: str, payload: dict, report: dict) -> None:
         op = payload.get("op")
-        remote_ts = float(payload.get("ts") or 0.0)
 
         if op == "tombstone":
+            if not hmac_mod.compare_digest(
+                str(payload.get("mac") or ""),
+                _tombstone_mac(self._mac_key, memory_id),
+            ):
+                report["skipped"] += 1  # a relay cannot forge deletions
+                return
             if self.store.journal.is_tombstoned(memory_id):
                 report["skipped"] += 1
                 return
-            # A tombstone in any shard suppresses the id everywhere.
-            self.store.forget(memory_id, mode="hard")
+            if self.store.get(memory_id) is not None:
+                self.store.forget(memory_id, mode="hard")
+            else:
+                # Never held it, but record the suppression: a replayed old
+                # upsert must not resurrect the id later.
+                self.store.journal.add_tombstone(memory_id, self.target.shard)
             report["tombstoned"] += 1
             return
 
@@ -209,15 +256,22 @@ class ShardSync:
         except (InvalidToken, KeyError, ValueError):
             report["skipped"] += 1  # foreign key or garbage: not ours to apply
             return
+        # The authenticated identity lives inside the ciphertext.
+        if data.get("id") != memory_id or data.get("shard") != self.target.shard:
+            report["skipped"] += 1  # blob moved between ids/collections: reject
+            return
+        remote_ts = float(data.get("ts") or 0.0)
 
-        local_ts = self.store.journal.last_ts_for(memory_id)
-        if local_ts >= remote_ts:
-            report["skipped"] += 1  # we have the same or newer state
+        owner_shard = self.store.shard_of(memory_id)
+        if owner_shard is not None and owner_shard != self.target.shard:
+            report["skipped"] += 1  # id already lives in another trust boundary
             return
 
-        memory = Memory.from_payload(memory_id, data)
-        self.store.apply_synced(memory, self.target.shard, remote_ts)
-        report["applied"] += 1
+        memory = Memory.from_payload(memory_id, data["payload"])
+        if self.store.apply_synced(memory, self.target.shard, remote_ts):
+            report["applied"] += 1
+        else:
+            report["skipped"] += 1
 
 
 def sync_shard(store: MemoryStore, shard: str, client=None) -> dict[str, int]:

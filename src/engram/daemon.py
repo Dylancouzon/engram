@@ -178,11 +178,13 @@ class Daemon:
             scopes = list(entry.get("scopes", []))
             if entry.get("token_hash"):
                 import hashlib
+                import hmac as hmac_mod
 
                 supplied = message.get("token")
                 if (not isinstance(supplied, str)
-                        or hashlib.sha256(supplied.encode()).hexdigest()
-                        != entry["token_hash"]):
+                        or not hmac_mod.compare_digest(
+                            hashlib.sha256(supplied.encode()).hexdigest(),
+                            entry["token_hash"])):
                     raise ProtocolError(
                         E_UNREGISTERED,
                         f"client {client!r} requires a valid capability token",
@@ -273,6 +275,7 @@ class Daemon:
         return {"memory": memory_to_wire(memory)}
 
     def _m_stats(self, params: dict, scopes: list[str], client: str) -> dict:
+        _check_scope(scopes, "*")  # shard names/counts are owner information
         return self.store.stats()
 
     def _m_reviews(self, params: dict, scopes: list[str], client: str) -> dict:

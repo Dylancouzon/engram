@@ -654,6 +654,9 @@ def hook_install(surface: str, yes: bool) -> None:
         "SessionStart": "engram hook session-start",
         "UserPromptSubmit": "engram hook user-prompt",
         "Stop": "engram hook capture",
+        # Long sessions compact before they Stop; capture there too so a
+        # day-long session's facts aren't lost to the context window.
+        "PreCompact": "engram hook capture",
     }
     added = []
     for event, command in wanted.items():
@@ -689,8 +692,41 @@ def hook_print_config() -> None:
                 {"type": "command", "command": "engram hook user-prompt"}]}],
             "Stop": [{"hooks": [
                 {"type": "command", "command": "engram hook capture"}]}],
+            "PreCompact": [{"hooks": [
+                {"type": "command", "command": "engram hook capture"}]}],
         }
     }, indent=2))
+
+
+_RULES_TEXT = """\
+## Memory (engram)
+
+You have a persistent long-term memory via the engram MCP tools. It is the
+source of truth for the user\'s stable preferences, decisions, and corrections.
+
+- BEFORE answering anything about the user, their projects, tools, people, or
+  past decisions, call `recall` with a natural-language query. Do not answer
+  from assumptions when memory might hold the fact.
+- When the user states a durable fact, preference, decision, or correction
+  ("remember...", "actually it\'s X not Y", "we decided..."), call `remember`
+  with one atomic, self-contained statement.
+- Trust recalled memories over your own guesses; a correction the user made
+  once should stick.
+"""
+
+
+@main.command()
+@click.argument("surface", type=click.Choice(["cursor", "windsurf", "generic"]))
+def rules(surface: str) -> None:
+    """Print a rules block for assistants WITHOUT hook support (Cursor,
+    Windsurf). Hooks make recall deterministic; where they don\'t exist,
+    rules + the MCP tools are the best available. Paste into .cursorrules,
+    .windsurfrules, or AGENTS.md."""
+    click.echo(_RULES_TEXT)
+    dest = {"cursor": ".cursor/rules or .cursorrules",
+            "windsurf": ".windsurf/rules or AGENTS.md",
+            "generic": "AGENTS.md / your system prompt"}[surface]
+    click.echo(f"# paste the block above into {dest}", err=True)
 
 
 @main.command()
