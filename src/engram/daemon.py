@@ -66,18 +66,26 @@ class ClientRegistry:
         return list(entry.get("scopes", [])) if entry else None
 
     def allow(self, client: str, scopes: list[str]) -> None:
+        if not scopes:
+            raise ValueError("scope allowlist cannot be empty (use '*' for everything)")
         data = self._load()
         data[client] = {"scopes": scopes}
-        self._path.write_text(json.dumps(data, indent=2) + "\n")
-        os.chmod(self._path, 0o600)
+        self._write(data)
 
     def revoke(self, client: str) -> bool:
         data = self._load()
         if client not in data:
             return False
         del data[client]
-        self._path.write_text(json.dumps(data, indent=2) + "\n")
+        self._write(data)
         return True
+
+    def _write(self, data: dict) -> None:
+        # Atomic replace: a reader never sees a partially-written registry.
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self._path)
 
     def list(self) -> dict[str, dict]:
         return {**{c: {"scopes": s} for c, s in _IMPLICIT_CLIENTS.items()}, **self._load()}
@@ -93,6 +101,35 @@ class Daemon:
         self.store = store
         self.registry = ClientRegistry(store.config)
         self._stop = threading.Event()
+        self._inflight = 0
+        self._inflight_cond = threading.Condition()
+
+    def _track_request(self):
+        import contextlib
+
+        @contextlib.contextmanager
+        def tracked():
+            with self._inflight_cond:
+                self._inflight += 1
+            try:
+                yield
+            finally:
+                with self._inflight_cond:
+                    self._inflight -= 1
+                    self._inflight_cond.notify_all()
+
+        return tracked()
+
+    def _drain(self, timeout: float = 10.0) -> None:
+        """Wait for in-flight requests before closing the store. Stragglers
+        past the timeout get errors — safe, because durability lives in the
+        journal ack, not the connection."""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        with self._inflight_cond:
+            while self._inflight and _time.monotonic() < deadline:
+                self._inflight_cond.wait(timeout=0.5)
 
     # -- request dispatch ------------------------------------------------------
 
@@ -126,6 +163,10 @@ class Daemon:
             return error_response(request_id, e.code, str(e))
         except WriteRefusedError as e:
             return error_response(request_id, E_REFUSED, str(e))
+        except (KeyError, TypeError, ValueError) as e:
+            # Missing/mistyped params are the client's fault; keep the code
+            # stable so clients can distinguish their bugs from ours.
+            return error_response(request_id, E_BAD_REQUEST, f"{type(e).__name__}: {e}")
         except Exception as e:  # noqa: BLE001 - the daemon must not die on a bad request
             return error_response(request_id, E_INTERNAL, f"{type(e).__name__}: {e}")
 
@@ -150,6 +191,8 @@ class Daemon:
         return {"actions": [action_to_wire(a) for a in actions]}
 
     def _m_recall(self, params: dict, scopes: list[str], client: str) -> dict:
+        if not scopes:
+            raise ProtocolError(E_SCOPE_DENIED, "client has an empty scope allowlist")
         scope = params.get("scope")
         if scope:
             _check_scope(scopes, scope)
@@ -164,25 +207,25 @@ class Daemon:
             type=MemoryType(mtype) if mtype else None,
             tags=params.get("tags"),
             as_of=params.get("as_of"),
+            reinforce=bool(params.get("reinforce", True)),
         )
         return {"hits": [hit_to_wire(h) for h in hits]}
 
     def _m_forget(self, params: dict, scopes: list[str], client: str) -> dict:
         memory_id = str(params["id"])
-        found = self.store.backend.retrieve([memory_id])
-        if not found:
+        memory = self.store.get(memory_id)
+        if memory is None:
             raise ProtocolError(E_NOT_FOUND, f"no memory {memory_id}")
-        _check_scope(scopes, found[0].payload.get("scope", "default"))
-        memory = self.store.forget(memory_id, mode=params.get("mode", "soft"))
-        return {"forgotten": memory is not None, "mode": params.get("mode", "soft")}
+        _check_scope(scopes, memory.scope)
+        forgotten = self.store.forget(memory_id, mode=params.get("mode", "soft"))
+        return {"forgotten": forgotten is not None, "mode": params.get("mode", "soft")}
 
     def _m_get(self, params: dict, scopes: list[str], client: str) -> dict:
         from engram.protocol import memory_to_wire
 
-        found = self.store.backend.retrieve([str(params["id"])])
-        if not found:
+        memory = self.store.get(str(params["id"]))
+        if memory is None:
             raise ProtocolError(E_NOT_FOUND, f"no memory {params['id']}")
-        memory = found[0].memory()
         _check_scope(scopes, memory.scope)
         return {"memory": memory_to_wire(memory)}
 
@@ -211,19 +254,25 @@ class Daemon:
         daemon = self
 
         class Handler(socketserver.StreamRequestHandler):
+            # A stuck or idle client releases its thread instead of holding
+            # it forever; clients reconnect transparently.
+            timeout = 600.0
+
             def handle(self) -> None:
-                while True:
+                while not daemon._stop.is_set():
                     try:
                         message = read_message(self.rfile)
                     except ProtocolError as e:
                         write_message(self.wfile, error_response(None, e.code, str(e)))
                         return
-                    except (ConnectionError, ValueError):
+                    except (ConnectionError, ValueError, TimeoutError, OSError):
                         return
                     if message is None:
                         return
+                    with daemon._track_request():
+                        response = daemon.handle(message)
                     try:
-                        write_message(self.wfile, daemon.handle(message))
+                        write_message(self.wfile, response)
                     except (ConnectionError, BrokenPipeError):
                         return
 
@@ -250,6 +299,7 @@ class Daemon:
             finally:
                 self._stop.set()
                 sock_path.unlink(missing_ok=True)
+                self._drain()
                 self.store.close()  # flushes buffered reinforcements too
 
     def stop(self) -> None:

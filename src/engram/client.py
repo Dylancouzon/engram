@@ -144,6 +144,7 @@ class Client:
         result = self.call(
             "recall", query=query, k=k, scope=scope,
             type=type.value if type else None, tags=tags, as_of=as_of,
+            reinforce=reinforce,
         )
         return [hit_from_wire(h) for h in result["hits"]]
 

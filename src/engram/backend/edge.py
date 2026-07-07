@@ -70,10 +70,12 @@ def build_filter(
     valid at that instant (pass now for current, a past ts for as-of
     queries); None skips validity filtering entirely."""
     must: list[Any] = []
-    if scope:
+    if scope is not None:
         if isinstance(scope, str):
             must.append(FieldCondition(key="scope", match=MatchValue(scope)))
         else:
+            # An empty allowlist matches NOTHING. It must never fall through
+            # to "no filter" — that inverts a deny into full access.
             must.append(FieldCondition(key="scope", match=MatchAny(any=list(scope))))
     if type:
         must.append(FieldCondition(key="type", match=MatchValue(type)))

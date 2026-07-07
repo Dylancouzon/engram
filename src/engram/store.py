@@ -24,6 +24,7 @@ import os
 import re
 import threading
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
@@ -43,6 +44,47 @@ from engram.resolve import Verdict, judge
 def _normalize(text: str) -> str:
     """Case/punctuation/whitespace-insensitive form for verbatim-dedup."""
     return re.sub(r"[\W_]+", " ", text.lower()).strip()
+
+
+class _ShardGuard:
+    """Readers-writer guard for the Edge backend's *lifetime* (not its data:
+    Edge tolerates reads interleaving with writes). Queries take shared
+    access; anything that closes or replaces the shard object — hard-forget
+    purge, rebuild, close — takes exclusive access, so a lock-free read can
+    never hit a closed shard mid-swap."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._exclusive = False
+
+    @contextmanager
+    def shared(self):
+        with self._cond:
+            while self._exclusive:
+                self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                self._cond.notify_all()
+
+    @contextmanager
+    def exclusive(self):
+        with self._cond:
+            while self._exclusive:
+                self._cond.wait()
+            self._exclusive = True
+            while self._readers:
+                self._cond.wait()
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._exclusive = False
+                self._cond.notify_all()
 
 
 class StoreLockedError(RuntimeError):
@@ -88,6 +130,7 @@ class MemoryStore:
         # Edge provides no locking and SQLite is externally serialized: every
         # mutation goes through this lock. Reads (query/scroll) stay lock-free.
         self._write_lock = threading.RLock()
+        self._shard_guard = _ShardGuard()
         self._reinforce_mode = reinforce_mode
         self._reinforce_queue: Counter[str] = Counter()
         self._reinforce_queue_lock = threading.Lock()
@@ -336,9 +379,10 @@ class MemoryStore:
             valid_at=as_of if as_of is not None else now_ts(),
         )
         # Over-fetch so the rescore has real headroom to reorder.
-        hits = self.backend.query_hybrid(
-            emb, k=k * 3, flt=flt, prefetch_limit=self.config.prefetch_limit
-        )
+        with self._shard_guard.shared():
+            hits = self.backend.query_hybrid(
+                emb, k=k * 3, flt=flt, prefetch_limit=self.config.prefetch_limit
+            )
 
         now = now_ts()
         rescored: list[RecallHit] = []
@@ -357,6 +401,12 @@ class MemoryStore:
         if reinforce and top:
             self._reinforce([r.memory.id for r in top])
         return top
+
+    def get(self, memory_id: str) -> Memory | None:
+        """Fetch one memory by id (shard-guarded; daemon read path)."""
+        with self._shard_guard.shared():
+            found = self.backend.retrieve([memory_id])
+        return found[0].memory() if found else None
 
     def _reinforce(self, memory_ids: list[str]) -> None:
         if self._reinforce_mode == "buffered":
@@ -436,22 +486,24 @@ class MemoryStore:
         import shutil
 
         survivors = self.backend.export_raw(exclude=exclude)
-        self.backend.close()
-        shard_dir = self.config.shard_dir
-        trash = shard_dir.with_name(shard_dir.name + ".purging")
-        shard_dir.rename(trash)
-        self.backend = EdgeBackend(shard_dir, dense_dim=self.config.dense_dim)
-        for point_id, vector, payload in survivors:
-            self.backend.upsert_raw(point_id, vector, payload)
-        self._applied_seq = self.journal.last_seq
-        self.backend.flush()
-        self.journal.mark_flushed(self._applied_seq)
+        with self._shard_guard.exclusive():
+            self.backend.close()
+            shard_dir = self.config.shard_dir
+            trash = shard_dir.with_name(shard_dir.name + ".purging")
+            shard_dir.rename(trash)
+            self.backend = EdgeBackend(shard_dir, dense_dim=self.config.dense_dim)
+            for point_id, vector, payload in survivors:
+                self.backend.upsert_raw(point_id, vector, payload)
+            self._applied_seq = self.journal.last_seq
+            self.backend.flush()
+            self.journal.mark_flushed(self._applied_seq)
         shutil.rmtree(trash)
 
     # -- maintenance ---------------------------------------------------------------
 
     def export_jsonl(self, fp: TextIO) -> int:
-        return self.journal.export_jsonl(fp)
+        with self._write_lock:
+            return self.journal.export_jsonl(fp)
 
     def rebuild(self, wipe: bool = True) -> int:
         """Rebuild the Edge index as a true projection of the journal:
@@ -465,9 +517,12 @@ class MemoryStore:
         if wipe:
             import shutil
 
-            self.backend.close()
-            shutil.rmtree(self.config.shard_dir)
-            self.backend = EdgeBackend(self.config.shard_dir, dense_dim=self.config.dense_dim)
+            with self._shard_guard.exclusive():
+                self.backend.close()
+                shutil.rmtree(self.config.shard_dir)
+                self.backend = EdgeBackend(
+                    self.config.shard_dir, dense_dim=self.config.dense_dim
+                )
         applied = 0
         tombstoned = self.journal.tombstones()
         for entry in self.journal.entries():
@@ -495,7 +550,7 @@ class MemoryStore:
     def close(self) -> None:
         try:
             self.flush_reinforce()
-            with self._write_lock:
+            with self._write_lock, self._shard_guard.exclusive():
                 self.backend.flush()
                 self.journal.mark_flushed(self._applied_seq)
                 self.backend.close()

@@ -22,7 +22,9 @@ from engram.models import Memory, RecallHit
 from engram.store import WriteAction
 
 PROTOCOL_VERSION = 1
-MAX_MESSAGE_BYTES = 4 * 1024 * 1024  # a memory is text, not a blob
+# Generous: requests are small, but an export response carries the whole
+# journal in one frame until a streaming export lands (M2).
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
 # Error codes (stable API surface — clients switch on these)
 E_UNREGISTERED = "unregistered_client"

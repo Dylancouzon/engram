@@ -34,13 +34,17 @@ def run_mcp(config: Config, client_name: str) -> None:
     client = Client(config, client_name)
     client.connect(spawn=True)
 
-    def call(fn, *args, **kwargs):
-        """One transparent reconnect if the daemon restarted under us."""
+    def call(fn, *args, retry: bool = False, **kwargs):
+        """Reconnect if the daemon restarted under us. Only idempotent calls
+        (recall) are replayed: a lost response to remember/forget may mean
+        the daemon already applied it, and a blind retry would duplicate."""
         try:
             return fn(*args, **kwargs)
         except DaemonUnavailable:
             client.close()
             client.connect(spawn=True)
+            if not retry:
+                raise
             return fn(*args, **kwargs)
 
     mcp = FastMCP("engram", instructions=_INSTRUCTIONS)
@@ -69,6 +73,9 @@ def run_mcp(config: Config, client_name: str) -> None:
                            type=_parse_type(type), source_ref=None)
         except WriteRefusedError as e:
             return f"Not stored: {e}."
+        except DaemonUnavailable:
+            return ("The memory daemon restarted while storing; the memory may or "
+                    "may not have been saved. Use recall to check before retrying.")
         except ProtocolError as e:
             return _protocol_help(e, client_name)
         if not actions:
@@ -95,7 +102,7 @@ def run_mcp(config: Config, client_name: str) -> None:
         preferences involved. Returns the most relevant memories, weighted
         by recency and importance. Query with natural language."""
         try:
-            hits = call(client.recall, query, k=k, scope=scope)
+            hits = call(client.recall, query, k=k, scope=scope, retry=True)
         except ProtocolError as e:
             return _protocol_help(e, client_name)
         if not hits:
@@ -114,7 +121,9 @@ def run_mcp(config: Config, client_name: str) -> None:
         purges it completely and irreversibly — only when the user
         explicitly asks for permanent deletion."""
         try:
-            done = call(client.forget, memory_id, mode="hard" if hard else "soft")
+            # Idempotent by id (forgetting twice converges), so retry is safe.
+            done = call(client.forget, memory_id, mode="hard" if hard else "soft",
+                        retry=True)
         except ProtocolError as e:
             return _protocol_help(e, client_name)
         if not done:

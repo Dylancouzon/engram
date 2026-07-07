@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -69,8 +70,10 @@ class Journal:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         existed = path.exists()
-        # Thread-affinity off: the journal is only ever touched under the
-        # store's write lock (daemon threads included).
+        # One shared connection, guarded by an internal lock: SQLite objects
+        # must not be used from two threads at once, and callers (daemon
+        # handler threads) are not trusted to serialize reads themselves.
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         if not existed:
             os.chmod(path, 0o600)  # memories are private by default
@@ -99,7 +102,7 @@ class Journal:
     ) -> list[int]:
         """Atomically record several intents (e.g. supersede = 2 upserts)."""
         seqs: list[int] = []
-        with self._conn:
+        with self._lock, self._conn:
             for op, memory_id, payload, key in intents:
                 if key is not None:
                     row = self._conn.execute(
@@ -122,13 +125,16 @@ class Journal:
 
     @property
     def flushed_seq(self) -> int:
-        row = self._conn.execute("SELECT value FROM meta WHERE key='flushed_seq'").fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='flushed_seq'"
+            ).fetchone()
         return int(row[0]) if row else 0
 
     def mark_flushed(self, seq: int) -> None:
         """Record that Edge has durably flushed everything up to `seq`.
         Monotonic by construction: the mark never moves backwards."""
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('flushed_seq', ?)"
                 " ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(excluded.value AS INTEGER),"
@@ -138,11 +144,13 @@ class Journal:
 
     def pending(self) -> list[JournalEntry]:
         """Intents not yet covered by an Edge flush — replayed on open."""
-        return list(self._iter_rows("WHERE seq > ?", (self.flushed_seq,)))
+        with self._lock:
+            return list(self._iter_rows("WHERE seq > ?", (self.flushed_seq,)))
 
     @property
     def last_seq(self) -> int:
-        row = self._conn.execute("SELECT MAX(seq) FROM journal").fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT MAX(seq) FROM journal").fetchone()
         return row[0] or 0
 
     # -- forgetting ---------------------------------------------------------
@@ -151,31 +159,37 @@ class Journal:
         """Purge every trace of a memory from the log, then VACUUM so the
         content doesn't survive in free pages. Leaves a content-free
         tombstone that suppresses the id."""
-        with self._conn:
-            self._conn.execute("DELETE FROM journal WHERE memory_id = ?", (memory_id,))
-            self._conn.execute(
-                "INSERT OR REPLACE INTO tombstones (memory_id, ts) VALUES (?, ?)",
-                (memory_id, time.time()),
-            )
-        self._conn.execute("VACUUM")
-        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        with self._lock:
+            with self._conn:
+                self._conn.execute("DELETE FROM journal WHERE memory_id = ?", (memory_id,))
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO tombstones (memory_id, ts) VALUES (?, ?)",
+                    (memory_id, time.time()),
+                )
+            self._conn.execute("VACUUM")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def is_tombstoned(self, memory_id: str) -> bool:
-        return (
-            self._conn.execute(
-                "SELECT 1 FROM tombstones WHERE memory_id = ?", (memory_id,)
-            ).fetchone()
-            is not None
-        )
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "SELECT 1 FROM tombstones WHERE memory_id = ?", (memory_id,)
+                ).fetchone()
+                is not None
+            )
 
     def tombstones(self) -> set[str]:
-        return {r[0] for r in self._conn.execute("SELECT memory_id FROM tombstones")}
+        with self._lock:
+            return {r[0] for r in self._conn.execute("SELECT memory_id FROM tombstones")}
 
     # -- export / replay -----------------------------------------------------
 
-    def entries(self) -> Iterator[JournalEntry]:
-        """Full log in seq order (replay = apply in order, last write wins)."""
-        yield from self._iter_rows("", ())
+    def entries(self) -> list[JournalEntry]:
+        """Full log in seq order (replay = apply in order, last write wins).
+        A consistent snapshot: materialized under the lock, so an export
+        never interleaves with a half-applied multi-row transaction."""
+        with self._lock:
+            return list(self._iter_rows("", ()))
 
     def export_jsonl(self, fp: TextIO) -> int:
         """Dump the whole journal as JSONL. Returns row count."""
@@ -193,7 +207,7 @@ class Journal:
         `scrub` runs over text fields — imported files may not come from a
         store that redacted on write."""
         n = 0
-        with self._conn:
+        with self._lock, self._conn:
             for line in fp:
                 line = line.strip()
                 if not line:
@@ -233,4 +247,5 @@ class Journal:
             )
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
