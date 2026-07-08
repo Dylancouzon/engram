@@ -183,6 +183,12 @@ class MemoryStore:
         # mutation goes through this lock. Reads (query/scroll) stay lock-free.
         self._write_lock = threading.RLock()
         self._shard_guard = _ShardGuard()
+        # Guards the lazy check-then-create of self.backends. Reads reach
+        # _backend() under _shard_guard.shared() and writes under _write_lock,
+        # so neither lock alone serializes two threads first-touching the same
+        # not-yet-opened shard — that could double-open the dir (Edge is
+        # single-writer) or crash _shard_order mid-sort. This does.
+        self._backends_lock = threading.Lock()
         self._reinforce_mode = reinforce_mode
         self._reinforce_queue: Counter[str] = Counter()
         self._reinforce_queue_lock = threading.Lock()
@@ -219,6 +225,10 @@ class MemoryStore:
             # resolution doesn't recompute the whole map on every serve refresh.
             self._map_epoch = 0
             self._map_cache: tuple[int, int, list[dict]] | None = None
+            # The models cache is written once (first download) and then
+            # static; stats() runs on every serve UI action, so memoize its
+            # size instead of rglob-walking ~600 MB of files on each click.
+            self._models_size: int | None = None
             if self._purge_marker.exists():
                 # A hard-forget purge (or its recovery) was interrupted. The
                 # journal is already clean, so rebuild the index from it.
@@ -243,11 +253,12 @@ class MemoryStore:
 
     def _backend(self, shard: str) -> EdgeBackend:
         validate_shard(shard)
-        if shard not in self.backends:
-            self.backends[shard] = EdgeBackend(
-                self.config.shard_path(shard), dense_dim=self.config.dense_dim,
-            )
-        return self.backends[shard]
+        with self._backends_lock:
+            if shard not in self.backends:
+                self.backends[shard] = EdgeBackend(
+                    self.config.shard_path(shard), dense_dim=self.config.dense_dim,
+                )
+            return self.backends[shard]
 
     def _open_existing_shards(self) -> None:
         """Open every shard already on disk (recall fans out across them),
@@ -265,7 +276,8 @@ class MemoryStore:
     def _shard_order(self) -> list[str]:
         """Open shards with private first — the tie-break winner when the same
         id turns up in more than one shard (recall dedup, id lookup)."""
-        return sorted(self.backends, key=lambda n: n != "private")
+        with self._backends_lock:
+            return sorted(self.backends, key=lambda n: n != "private")
 
     def _locate(self, memory_id: str) -> tuple[str, Hit] | None:
         """The shard holding this id and its current point, in one retrieve
@@ -296,6 +308,12 @@ class MemoryStore:
         self.backends = {}
         self._backend("private")
         self.rebuild(wipe=False)  # shards were just wiped
+        # A hard-forget crash between the journal DELETE-commit and its VACUUM
+        # leaves the forgotten plaintext in journal.db free pages / un-
+        # checkpointed WAL. The rows are already gone from the log (so the
+        # rebuild above is correct), but the bytes are not — reclaim them now,
+        # or byte-level forget silently fails on exactly this crash window.
+        self.journal.vacuum()
         self._purge_marker.unlink()
 
     def _mark_flushed(self, seq: int) -> None:
@@ -521,7 +539,7 @@ class MemoryStore:
                            queued_review=queue)
 
     def _commit_payload(self, m: Memory, shard: str,
-                        partial: dict | None = None, flush: bool = True) -> None:
+                        partial: dict | None = None) -> None:
         """Journal a full-payload upsert but apply it to Edge as a payload-only
         set — no re-embed, because the text is unchanged. `partial` defaults to
         the whole payload; pass a subset (e.g. {"valid_to": ...}) to touch only
@@ -534,10 +552,8 @@ class MemoryStore:
         with self._apply_guard():
             backend.set_payload(m.id, partial if partial is not None else payload)
             self._applied_seq = max(self._applied_seq, seq)
-            if flush:
-                backend.flush()
-        if flush:
-            self._mark_flushed(self._applied_seq)
+            backend.flush()
+        self._mark_flushed(self._applied_seq)
 
     def _commit_upserts(self, memories: list[Memory], shard: str = "private") -> None:
         backend = self._backend(shard)
@@ -827,13 +843,23 @@ class MemoryStore:
             backend.close()
             shard_dir = self.config.shard_path(shard)
             trash = shard_dir.with_name(shard_dir.name + ".purging")
+            if trash.exists():
+                # Leftover from an earlier purge that died before its cleanup;
+                # rename() below would fail with it in the way.
+                shutil.rmtree(trash)
             shard_dir.rename(trash)
             new_backend = EdgeBackend(shard_dir, dense_dim=self.config.dense_dim)
             self.backends[shard] = new_backend
-            for point_id, vector, payload in survivors:
-                new_backend.upsert_raw(point_id, vector, payload)
-            self._applied_seq = self.journal.last_seq
-            new_backend.flush()
+            # Guard the re-insert like every other Edge-apply: if it fails
+            # mid-rebuild (e.g. ENOSPC right after the hard-forget VACUUM), the
+            # live shard is left holding only some survivors — freeze the flush
+            # mark so a later write can't seal the gap, and leave purge.pending
+            # in place so the next open rebuilds from the journal.
+            with self._apply_guard():
+                for point_id, vector, payload in survivors:
+                    new_backend.upsert_raw(point_id, vector, payload)
+                self._applied_seq = self.journal.last_seq
+                new_backend.flush()
             self._mark_flushed(self._applied_seq)
         self._map_epoch += 1
         shutil.rmtree(trash)
@@ -918,6 +944,12 @@ class MemoryStore:
         as 'sync-pull' with the ORIGIN timestamp: push never re-uploads it,
         and future LWW comparisons use origin time, not arrival time."""
         with self._write_lock:
+            # Re-check both guards HERE under the lock: a hard-forget that
+            # raced this pull may have tombstoned the id (and deleted its rows,
+            # so last_ts_for would read 0.0 and wave the memory back in) —
+            # a tombstone anywhere must suppress it, never resurrect.
+            if self.journal.is_tombstoned(memory.id):
+                return False
             if self.journal.last_ts_for(memory.id) >= remote_ts:
                 return False
             backend = self._backend(shard)
@@ -952,6 +984,11 @@ class MemoryStore:
     def consolidate(self, stop=None) -> dict[str, int]:
         from engram.consolidate import consolidate
 
+        # Drain buffered access bumps first, or decay-prune reads a stale
+        # access_count=0 and can prune a memory recalled seconds ago. The
+        # daemon's idle path flushes right before calling this; the manual
+        # `engram consolidate` RPC does not — so do it here for both.
+        self.flush_reinforce()
         return consolidate(self, stop=stop)
 
     def sync(self, shard: str) -> dict:
@@ -999,9 +1036,20 @@ class MemoryStore:
         ]
 
     def stats(self) -> dict:
+        # Snapshot the backend set under the same guards every other read uses:
+        # _backends_lock so a concurrent lazy-create can't mutate the dict
+        # mid-iteration, _shard_guard.shared() so a hard-forget purge can't
+        # close a shard out from under count().
+        with self._shard_guard.shared():
+            with self._backends_lock:
+                backends = list(self.backends.items())
+            points = sum(b.count() for _, b in backends)
+            shards = {name: b.count() for name, b in sorted(backends)}
+        if self._models_size is None:
+            self._models_size = _dir_size(self.config.models_dir)
         info: dict = {
-            "points": sum(b.count() for b in self.backends.values()),
-            "shards": {name: b.count() for name, b in sorted(self.backends.items())},
+            "points": points,
+            "shards": shards,
             "journal_entries": self.journal.row_count,
             "flushed_seq": self.journal.flushed_seq,
             "tombstones": len(self.journal.tombstones()),
@@ -1009,12 +1057,21 @@ class MemoryStore:
             "data_dir": str(self.config.data_dir),
             "disk": {
                 "data": _human_size(_dir_size(self.config.data_dir)),
-                "models_cache": _human_size(_dir_size(self.config.models_dir)),
+                "models_cache": _human_size(self._models_size),
             },
             "dense_model": DENSE_MODEL,
             "extraction": "ollama" if self.llm and self.llm.available()
                           else "verbatim fallback",
         }
+        if self._flush_damaged:
+            # A post-ack Edge apply failed this session; the flush mark is
+            # frozen and replay-on-restart will refill the gap. Surface it so
+            # a silent durability freeze isn't invisible until someone diffs
+            # seq numbers by hand.
+            info["flush_damaged"] = (
+                "a write did not reach the index; restart engram to rebuild"
+                " the affected shard from the journal"
+            )
         events = self.journal.event_summary()
         if events:
             info["triggers"] = {

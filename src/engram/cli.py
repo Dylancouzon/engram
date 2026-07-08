@@ -404,6 +404,7 @@ def seed(data_dir: str | None, paths: tuple[Path, ...], scope: str, shard: str) 
             chunks.append((chunk, str(path)))
     click.echo(f"seeding {len(chunks)} chunks from {len(files)} file(s)...")
     counts: dict[Op, int] = {}
+    refused = 0
     with _open_surface(data_dir) as store, click.progressbar(chunks, label="remembering") as bar:
         for text, ref in bar:
             try:
@@ -411,8 +412,10 @@ def seed(data_dir: str | None, paths: tuple[Path, ...], scope: str, shard: str) 
                                              surface="seed"):
                     counts[action.op] = counts.get(action.op, 0) + 1
             except WriteRefusedError:
-                continue
+                refused += 1  # redaction blocked it (e.g. a private key)
     summary = ", ".join(f"{op.value.lower()} {n}" for op, n in sorted(counts.items()))
+    if refused:
+        summary = f"{summary or 'nothing stored'}; refused {refused} (contained secrets)"
     click.echo(f"done: {summary or 'nothing stored'}")
 
 
@@ -653,8 +656,13 @@ def hook() -> None:
 @hook.command("session-start")
 @click.option("--scope", default=None)
 @click.option("-k", type=int, default=5)
+@click.option("--min-score", type=float, default=0.35,
+              help="Minimum absolute similarity to inject (noise gate). Lower"
+                   " than the user-prompt gate: the synthetic project query"
+                   " scores lower than a real prompt. Tune to taste.")
 @click.pass_obj
-def hook_session_start(data_dir: str | None, scope: str | None, k: int) -> None:
+def hook_session_start(data_dir: str | None, scope: str | None, k: int,
+                       min_score: float) -> None:
     """Claude Code SessionStart hook: surface memories relevant to the
     project being opened. Reads the hook payload on stdin, prints a context
     block on stdout. Speculative recall: never reinforces."""
@@ -662,7 +670,12 @@ def hook_session_start(data_dir: str | None, scope: str | None, k: int) -> None:
     cwd = Path(payload.get("cwd") or Path.cwd())
     query = f"project {cwd.name} preferences conventions decisions corrections"
     with _open_surface(data_dir) as store:
-        hits = store.recall(query, k=k, scope=scope, reinforce=False)
+        # Gate on RAW similarity, and over-fetch before the gate so a genuinely
+        # on-topic hit isn't crowded out of the top-k by the recency/importance
+        # rescore before it's even scored. Without the gate an unrelated repo
+        # gets k random nearest neighbours injected every session start.
+        raw = store.recall(query, k=k * 3, scope=scope, reinforce=False)
+        hits = [h for h in raw if h.similarity >= min_score][:k]
         store.log_event("session-start-recall", hits=len(hits))
         pending = len(store.pending_reviews())
     if hits:
@@ -693,8 +706,11 @@ def hook_user_prompt(data_dir: str | None, scope: str | None, k: int,
     if len(prompt) < 12:  # nothing to match against
         return
     with _open_surface(data_dir) as store:
-        hits = [h for h in store.recall(prompt, k=k, scope=scope, reinforce=False)
-                if h.similarity >= min_score]
+        # Over-fetch, gate on RAW similarity, then cap: filtering the already
+        # top-k-by-blended-score list would let a fresh-but-off-topic memory
+        # crowd out an on-topic one before the gate ever sees it.
+        raw = store.recall(prompt, k=k * 3, scope=scope, reinforce=False)
+        hits = [h for h in raw if h.similarity >= min_score][:k]
         store.log_event("prompt-recall", hits=len(hits))
     if not hits:
         return

@@ -128,6 +128,24 @@ def test_tombstone_propagates_and_purges(tmp_path, cloud):
         b.close()
 
 
+def test_apply_synced_refuses_tombstoned_id(config):
+    """A stale relay copy of a hard-forgotten memory must not resurrect it.
+    hard_forget deletes the journal rows, so last_ts_for reads 0.0 and the LWW
+    guard alone would wave it back in — the tombstone recheck under the write
+    lock is what blocks it."""
+    from engram.models import now_ts
+    store = make_store(config)
+    try:
+        [a] = store.remember("Dylan prefers window seats", shard="me-synced")
+        mem = store.get(a.memory.id)
+        store.forget(a.memory.id, mode="hard")  # tombstones + purges the id
+        applied = store.apply_synced(mem, "me-synced", remote_ts=now_ts() + 1000)
+        assert applied is False
+        assert store.get(a.memory.id) is None
+    finally:
+        store.close()
+
+
 def test_private_shard_refuses_sync_config(config):
     with pytest.raises(SyncError):
         save_target(config, SyncTarget(shard="private", url="x", api_key=None,

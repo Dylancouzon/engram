@@ -101,6 +101,46 @@ full-scanning. **Flagged, not fixed** (needs Dylan): `shared:<group>` pools
 reuse one sync key across all shards, so they aren't isolated between people —
 irrelevant solo, a real design decision before inviting anyone.
 
+A cross-cutting/seam pass (10 Sonnet reviewers scoped to whole-flow
+correctness, concurrency, perf-under-age, and honesty gaps — deliberately NOT
+the per-file work the prior pass covered; findings ponytail-filtered) fixed 16
+things, 5 new tests, all green (**145 tests**). **Correctness/durability:**
+`_purge_shard` was the one Edge-mutating path not wrapped in `_apply_guard` —
+a rebuild that failed mid-way (ENOSPC right after the hard-forget VACUUM) left
+the live daemon serving a partial shard and let the flush mark advance past
+the gap; now guarded, and a leftover `.purging` dir is cleared before rename
+(a second same-shard forget used to wedge on it). `apply_synced` now re-checks
+`is_tombstoned` under the write lock (a hard-forget racing a sync-pull could
+resurrect: the purge deletes the rows, so `last_ts_for` reads 0 and the LWW
+guard alone waved it back in). `_recover_interrupted_purge` now re-VACUUMs the
+journal — a crash between `hard_forget`'s DELETE-commit and its VACUUM left the
+forgotten plaintext in free pages, and recovery rebuilt Edge but never
+reclaimed them (byte-forget privacy gap). `consolidate()` drains buffered
+reinforcement first, or the manual RPC path decay-prunes a memory recalled
+seconds ago (stale `access_count=0`; the idle path masked it). **Concurrency:**
+a dedicated `_backends_lock` guards the lazy check-then-create of
+`self.backends` and the `_shard_order`/`stats` snapshots — reached under
+`_write_lock` OR `_shard_guard.shared()` with no common lock, two threads
+first-touching a new shard could double-open it or crash mid-sort; `stats()`
+also now takes the shard guard (use-after-close vs a purge); daemon shutdown
+joins the flusher before `store.close()` so a phase-3 consolidation can't
+touch a closed journal. **Recall quality:** both hooks over-fetch, gate on RAW
+similarity, then cap (filtering the already-truncated top-k let a fresh-but-
+off-topic memory crowd out an on-topic one), and `session-start` gained the
+noise gate it never had (`--min-score`, default 0.35 — the synthetic project
+query scores lower than a real prompt). **Honesty:** the daemon flusher logs
+failures to stderr instead of swallowing them, and a frozen flush mark
+(`_flush_damaged`) surfaces in `stats()`; `config.toml` warns on an unknown
+key; `seed` reports `refused: N`; serve's chat emits a "model stopped
+responding" frame instead of an empty stream. **Perf:** `sync push` uses an
+indexed `entries_after(seq, shard)` instead of deserializing the whole journal
+each push; `stats()` memoizes the static ~600MB models-cache size (was an
+rglob on every serve UI click). **Cleanups:** dead `_commit_payload(flush=)`
+param removed; `review_to_wire` now round-trips `shard`; stale "consolidate
+holds the write lock through summarization" comment corrected. **Left as-is
+(Dylan's call):** `snapshot` still omits `sync.key`/`sync.json`, so restoring
+onto a fresh device needs the key re-copied by hand.
+
 Not built (deliberate cuts, not omissions): Wave-C/D ingestion adapters
 (email/messages/voice/CLIP) — the adapter *contract* is documented in
 `docs/ingestion.md` and the write path is proven, so these are per-source

@@ -67,6 +67,35 @@ def test_interrupted_purge_recovers_on_open(config):
         reopened.close()
 
 
+def test_interrupted_hard_forget_reclaims_bytes_on_open(config):
+    """A crash between hard_forget's DELETE-commit and its VACUUM leaves the
+    forgotten plaintext in journal.db free pages. Recovery rebuilds the shard
+    AND re-VACUUMs, so the bytes don't survive on exactly this crash window."""
+    store = make_store(config)
+    [a] = store.remember(f"the secret is {SENTINEL}")
+    store.remember("Dylan prefers window seats")
+    # Simulate the crash: the DELETE + tombstone committed, but the process
+    # died before VACUUM and before the shard purge-rebuild.
+    with store.journal._conn:
+        store.journal._conn.execute(
+            "DELETE FROM journal WHERE memory_id = ?", (a.memory.id,))
+        store.journal._conn.execute(
+            "INSERT OR REPLACE INTO tombstones (memory_id, ts, shard)"
+            " VALUES (?, 1.0, 'private')", (a.memory.id,))
+    (config.data_dir / "purge.pending").touch()
+    store.close()
+    # Precondition: the bytes are still on disk (the shard still holds it).
+    assert _grep_tree(config.data_dir, SENTINEL.encode())
+
+    reopened = make_store(config)
+    try:
+        assert not (config.data_dir / "purge.pending").exists()
+        assert reopened.backend.count() == 1  # only the survivor
+    finally:
+        reopened.close()
+    assert _grep_tree(config.data_dir, SENTINEL.encode()) == []
+
+
 def test_import_scrubs_unredacted_payloads(config):
     fake_key = "".join(["AKIA", "IOSFODNN7", "EXAMPLE"])
     line = (

@@ -2,7 +2,7 @@
 # Distribution name (PyPI): the bare "engram" is taken there and shared by
 # several unrelated AI-memory projects; the CLI and module stay `engram`.
 name = "qdrant-engram"
-version = "0.1.0"
+version = "0.1.1"
 description = "Qdrant Engram: a personal, local-first, long-term memory for AI assistants — built on Qdrant Edge, exposed over MCP."
 readme = "README.md"
 license = "Apache-2.0"

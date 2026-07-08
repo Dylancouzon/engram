@@ -290,9 +290,17 @@ class _BaseHandler(BaseHTTPRequestHandler):
                                  "pull the model to chat about your memories)"})
             self._line({"done": True})
             return
+        streamed = 0
         for chunk in self.llm.chat(messages):
+            streamed += 1
             if not self._line({"token": chunk}):
                 return  # client disconnected; llm.chat closes its upstream
+        if streamed == 0:
+            # available() passed the pre-flight probe but the model produced
+            # nothing — it died or refused mid-request. Say so instead of
+            # ending an empty stream that reads as a blank answer.
+            self._line({"token": "(local model stopped responding mid-request — "
+                                 "check `ollama serve`)"})
         self._line({"done": True})
 
     def _line(self, obj) -> bool:

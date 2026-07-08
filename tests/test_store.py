@@ -357,3 +357,11 @@ def test_dashboard_renders_memories_and_events(store):
     # the <script type="application/json"> element.
     payload = html.split('id="data">')[1].split("</script>")[0]
     assert "</" not in payload
+
+
+def test_flush_damaged_surfaces_in_stats(store):
+    """A post-ack Edge-apply failure freezes the flush mark; stats() must
+    surface it so a silent durability freeze isn't invisible."""
+    assert "flush_damaged" not in store.stats()
+    store._flush_damaged = True
+    assert "flush_damaged" in store.stats()

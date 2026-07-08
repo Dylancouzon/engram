@@ -4,6 +4,25 @@ accepting applies the judged op late; rejecting keeps both."""
 from conftest import FakeLLM, make_store
 
 from engram.models import Op
+from engram.protocol import review_from_wire, review_to_wire
+from engram.store import ReviewItem
+
+
+def test_review_shard_survives_the_wire():
+    """review_to_wire dropped shard, so a review on a non-private shard came
+    back as private through the daemon — add it so the wire form is lossless."""
+    item = ReviewItem(
+        seq=7, proposed_op=Op.UPDATE, new=_mem("a"), target=_mem("b"),
+        confidence=0.7, merged_text="m", shard="me-synced")
+    restored = review_from_wire(review_to_wire(item))
+    assert restored.shard == "me-synced"
+
+
+def _mem(text):
+    import uuid
+
+    from engram.models import Memory, new_memory_id
+    return Memory(id=new_memory_id(uuid.uuid4()), text=text)
 
 
 def _ambiguous_supersede(config):

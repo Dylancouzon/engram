@@ -112,6 +112,7 @@ def review_to_wire(item: Any) -> dict[str, Any]:
         "target": memory_to_wire(item.target),
         "confidence": item.confidence,
         "merged_text": item.merged_text,
+        "shard": item.shard,
     }
 
 
@@ -126,6 +127,7 @@ def review_from_wire(data: dict[str, Any]) -> Any:
         target=memory_from_wire(data["target"]),
         confidence=data.get("confidence", 0.0),
         merged_text=data.get("merged_text"),
+        shard=data.get("shard", "private"),
     )
 
 

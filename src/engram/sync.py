@@ -156,9 +156,7 @@ class ShardSync:
         points: list[qm.PointStruct] = []
         top = pushed_seq
 
-        for entry in self.store.journal.entries():
-            if entry.seq <= pushed_seq or entry.shard != self.target.shard:
-                continue
+        for entry in self.store.journal.entries_after(pushed_seq, self.target.shard):
             top = max(top, entry.seq)
             if entry.op == "upsert" and entry.payload is not None:
                 # id, ts and shard live INSIDE the ciphertext: a relay that

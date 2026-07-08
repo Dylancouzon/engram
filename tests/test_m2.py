@@ -74,6 +74,24 @@ def test_consolidate_prunes_stale_episodes(config):
         store.close()
 
 
+def test_consolidate_flushes_reinforcement_before_pruning(config):
+    """Buffered mode (the daemon's mode): a recall's access bump only queues.
+    consolidate() must drain it first, or decay-prune reads access_count=0 and
+    prunes a memory that was recalled seconds ago."""
+    store = MemoryStore(config, embedder=FakeEmbedder(), llm=None,
+                        reinforce_mode="buffered")
+    try:
+        m = _aged(store, "grabbed a coffee with Sam", 90,
+                  type=MemoryType.EPISODIC, importance=0.2)
+        store.recall("coffee with Sam", reinforce=True)  # queues a bump only
+        assert store.get(m.id).access_count == 0  # not yet applied to Edge
+        report = store.consolidate()
+        assert report["pruned"] == 0  # the drained bump spared it
+        assert store.get(m.id).is_valid
+    finally:
+        store.close()
+
+
 def test_consolidate_dedups_identical(config):
     store = make_store(config)
     try:

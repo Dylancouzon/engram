@@ -43,8 +43,9 @@ class Client:
         self.client_name = client_name
         self.token = token or os.environ.get("ENGRAM_TOKEN")
         # Socket read timeout. remember() with extraction is slow; consolidate
-        # ("sleep") holds the write lock through LLM summarization and can run
-        # far longer, so that caller passes a larger value.
+        # runs a sequence of summarization model calls and can take far longer
+        # (though it never holds the write lock across one), so that caller
+        # passes a larger value.
         self._timeout = timeout
         self._sock: socket.socket | None = None
         self._rfile = None

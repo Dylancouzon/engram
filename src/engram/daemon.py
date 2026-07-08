@@ -18,6 +18,7 @@ import json
 import os
 import signal
 import socketserver
+import sys
 import threading
 import time as _time
 from time import monotonic as _monotonic
@@ -422,6 +423,12 @@ class Daemon:
             finally:
                 self._stop.set()
                 sock_path.unlink(missing_ok=True)
+                # Let the flusher notice _stop and finish its current
+                # flush/consolidate before we close the store — otherwise a
+                # phase-3 consolidation could touch the journal after close()
+                # shut it. The flusher is idle-waiting in the common case, so
+                # this returns at once; the timeout bounds a stuck model call.
+                flusher.join(timeout=5.0)
                 self._drain()
                 self.store.close()  # flushes buffered reinforcements too
 
@@ -434,13 +441,22 @@ class Daemon:
         from engram.consolidate import last_run
 
         while not self._stop.wait(REINFORCE_FLUSH_SECONDS):
-            with contextlib.suppress(Exception):  # keep the flusher alive
+            # The flusher must stay alive across a failure, but a swallowed one
+            # is a silent durability/housekeeping freeze — log it to stderr
+            # (the daemon's own log, never a hook's stdout) so it's visible.
+            try:
                 self.store.flush_reinforce()
-            with contextlib.suppress(Exception):
+            except Exception as e:  # noqa: BLE001 - keep the flusher alive
+                print(f"engram daemon: flush_reinforce failed: {e!r}",
+                      file=sys.stderr, flush=True)
+            try:
                 idle = _monotonic() - self._last_request
                 if (self._last_request and idle >= IDLE_FOR_CONSOLIDATION
                         and _time.time() - last_run(self.store) >= CONSOLIDATE_EVERY):
                     self.store.consolidate(stop=self._stop)
+            except Exception as e:  # noqa: BLE001 - keep the flusher alive
+                print(f"engram daemon: consolidation failed: {e!r}",
+                      file=sys.stderr, flush=True)
 
 
 def run_daemon(config: Config | None = None) -> None:

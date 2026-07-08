@@ -259,6 +259,15 @@ class Journal:
         with self._lock:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
+    def vacuum(self) -> None:
+        """Reclaim freed pages and truncate the WAL. Used by crash recovery
+        after an interrupted hard-forget: the rows were deleted but their
+        bytes can still linger in free pages / un-checkpointed WAL frames, so
+        this re-issues what hard_forget's own VACUUM would have."""
+        with self._lock:
+            self._conn.execute("VACUUM")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     def is_tombstoned(self, memory_id: str) -> bool:
         with self._lock:
             return (
@@ -345,6 +354,14 @@ class Journal:
         never interleaves with a half-applied multi-row transaction."""
         with self._lock:
             return list(self._iter_rows("", ()))
+
+    def entries_after(self, seq: int, shard: str) -> list[JournalEntry]:
+        """One shard's rows past `seq`, in seq order — the sync push delta.
+        Filters in SQL (seq is the primary key) instead of scanning and
+        JSON-decoding the whole log on every push, which grows for years."""
+        with self._lock:
+            return list(self._iter_rows(
+                "WHERE seq > ? AND shard = ?", (seq, shard)))
 
     def review_rows(self) -> list[JournalEntry]:
         """Just the review / review_resolved rows, in seq order. Scanning the

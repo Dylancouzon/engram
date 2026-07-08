@@ -15,6 +15,7 @@ Layout:
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 import uuid
 from dataclasses import dataclass, field, fields
@@ -126,7 +127,14 @@ class Config:
             overrides = tomllib.loads(toml_path.read_text())
             valid = {f.name for f in fields(cls)}
             for key, value in overrides.items():
-                if key not in valid or key == "data_dir":
+                if key == "data_dir":
+                    continue  # set via ENGRAM_HOME / constructor, not the file
+                if key not in valid:
+                    # A typo'd or since-removed knob does nothing; say so rather
+                    # than let the user believe an override took (stderr, so a
+                    # hook's stdout context stays clean).
+                    print(f"engram: config.toml: ignoring unknown key {key!r}",
+                          file=sys.stderr)
                     continue
                 current = getattr(cfg, key)
                 # config.toml is hand-edited: coerce a mistyped number
