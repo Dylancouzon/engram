@@ -37,10 +37,15 @@ class DaemonUnavailable(RuntimeError):
 
 
 class Client:
-    def __init__(self, config: Config, client_name: str, token: str | None = None):
+    def __init__(self, config: Config, client_name: str, token: str | None = None,
+                 timeout: float = 120.0):
         self.config = config
         self.client_name = client_name
         self.token = token or os.environ.get("ENGRAM_TOKEN")
+        # Socket read timeout. remember() with extraction is slow; consolidate
+        # ("sleep") holds the write lock through LLM summarization and can run
+        # far longer, so that caller passes a larger value.
+        self._timeout = timeout
         self._sock: socket.socket | None = None
         self._rfile = None
         self._wfile = None
@@ -70,7 +75,7 @@ class Client:
             return False
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            sock.settimeout(120.0)  # remember() with extraction can take a while
+            sock.settimeout(self._timeout)
             sock.connect(str(path))
         except OSError:
             sock.close()
@@ -185,6 +190,18 @@ class Client:
 
     def map_points(self, neighbors: int = 3) -> list[dict]:
         return list(self.call("map_points", neighbors=neighbors)["points"])
+
+    def edit(self, memory_id: str, *, scope: str | None = None,
+             tags: list[str] | None = None,
+             importance: float | None = None) -> Memory | None:
+        try:
+            result = self.call("edit", id=memory_id, scope=scope, tags=tags,
+                               importance=importance)
+            return memory_from_wire(result["memory"])
+        except ProtocolError as e:
+            if e.code == "not_found":
+                return None
+            raise
 
     def pending_reviews(self) -> list:
         from engram.protocol import review_from_wire

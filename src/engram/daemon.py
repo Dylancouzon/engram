@@ -298,6 +298,27 @@ class Daemon:
         _check_scope(scopes, "*")  # a projection over every memory is owner-wide
         return {"points": self.store.map_points(int(params.get("neighbors", 3)))}
 
+    def _m_edit(self, params: dict, scopes: list[str], client: str) -> dict:
+        from engram.protocol import memory_to_wire
+
+        current = self.store.get(str(params["id"]))
+        if current is None:
+            raise ProtocolError(E_NOT_FOUND, f"no memory {params['id']}")
+        new_scope = params.get("scope")
+
+        def authorize(located):  # runs under the write lock, on the current state
+            _check_scope(scopes, located.scope)  # must be allowed the source scope
+            if new_scope is not None:
+                _check_scope(scopes, new_scope)  # ...and the destination on a move
+
+        updated = self.store.edit_metadata(
+            current.id, scope=new_scope, tags=params.get("tags"),
+            importance=params.get("importance"), authorize=authorize,
+        )
+        if updated is None:
+            raise ProtocolError(E_NOT_FOUND, f"no memory {params['id']}")
+        return {"memory": memory_to_wire(updated)}
+
     def _m_reviews(self, params: dict, scopes: list[str], client: str) -> dict:
         from engram.protocol import review_to_wire
 

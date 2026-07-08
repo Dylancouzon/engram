@@ -277,6 +277,22 @@ def dashboard(data_dir: str | None, output: Path | None, open_browser: bool) -> 
 
 
 @main.command()
+@click.option("-p", "--port", type=int, default=0,
+              help="Port to bind on 127.0.0.1 (default: an ephemeral free port).")
+@click.option("--open/--no-open", "open_browser", default=True,
+              help="Open the app in the browser.")
+@click.pass_obj
+def serve(data_dir: str | None, port: int, open_browser: bool) -> None:
+    """Launch the interactive local app: manage memories, chat with the local
+    model about them, and trigger the sleep pass. Private — binds 127.0.0.1
+    only and is token-gated. Runs until Ctrl-C. (For a static, zero-server
+    snapshot instead, use `engram dashboard`.)"""
+    from engram.serve import serve as run_serve
+
+    run_serve(_config(data_dir), port=port, open_browser=open_browser)
+
+
+@main.command()
 @click.argument("target")
 @click.option("--hard", is_flag=True,
               help="Purge completely (index, journal, exports) and tombstone the id. "

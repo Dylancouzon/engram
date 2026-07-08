@@ -40,6 +40,48 @@ class LocalLLM:
             self._probed_at = now
         return self._available
 
+    def chat(self, messages: list[dict], *, temperature: float = 0.4):
+        """Stream a chat completion from Ollama, yielding text chunks as they
+        arrive. Silent empty generator on any failure — the caller shows a
+        'model offline' state. `think` is off (qwen3) since a streamed
+        response can't be regex-stripped of <think> after the fact."""
+        body = json.dumps(
+            {
+                "model": self._model,
+                "messages": messages,
+                "stream": True,
+                "think": False,
+                "options": {"temperature": temperature},
+            }
+        ).encode()
+        req = urllib.request.Request(
+            self._url + "/api/chat", data=body, headers={"Content-Type": "application/json"}
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=self._timeout)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return
+        try:
+            for raw in resp:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except ValueError:
+                    continue
+                chunk = obj.get("message", {}).get("content", "")
+                if chunk:
+                    yield chunk
+                if obj.get("done"):
+                    break
+        except (urllib.error.URLError, TimeoutError, OSError):
+            # Mid-stream drop (Ollama died / timed out): end the generator
+            # cleanly so the caller can still emit its terminal frame.
+            return
+        finally:
+            resp.close()
+
     def generate_json(self, system: str, prompt: str) -> Any | None:
         """One chat turn constrained to JSON. Returns the parsed value, or
         None on any failure — callers must have a verbatim fallback."""

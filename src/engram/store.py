@@ -24,6 +24,7 @@ import os
 import re
 import threading
 from collections import Counter
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -628,6 +629,41 @@ class MemoryStore:
              "neighbors": [ids[j] for j in nbr[i]]}
             for i, pid in enumerate(ids)
         ]
+
+    def edit_metadata(self, memory_id: str, *, scope: str | None = None,
+                      tags: list[str] | None = None,
+                      importance: float | None = None,
+                      authorize: Callable[[Memory], None] | None = None) -> Memory | None:
+        """Change a memory's scope / tags / importance in place — payload only,
+        no re-embed (the text is unchanged). Journaled as an `upsert` so a
+        rebuild converges and the sync LWW clock counts it as the content edit
+        it is. Text corrections are deliberately not editable here: that is a
+        supersede — `remember` the correction and let the judge handle it.
+
+        `authorize` runs against the freshly located memory INSIDE the write
+        lock, so a caller's scope check can't be raced by a concurrent move
+        between check and apply — it raises to refuse."""
+        with self._write_lock:
+            located = self._locate(memory_id)
+            if located is None:
+                return None
+            shard, hit = located
+            m = hit.memory()
+            if authorize is not None:
+                authorize(m)
+            if scope is not None:
+                m.scope = scope
+            if tags is not None:
+                m.tags = list(dict.fromkeys(t.lower() for t in tags))
+            if importance is not None:
+                m.importance = max(0.0, min(1.0, float(importance)))
+            payload = m.to_payload()
+            seq = self.journal.append("upsert", m.id, payload, shard=shard)
+            self._backend(shard).set_payload(m.id, payload)
+            self._applied_seq = max(self._applied_seq, seq)
+            self._backend(shard).flush()
+            self.journal.mark_flushed(self._applied_seq)
+            return m
 
     def _reinforce(self, memory_ids: list[str]) -> None:
         if self._reinforce_mode == "buffered":

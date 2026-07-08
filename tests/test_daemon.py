@@ -175,6 +175,33 @@ def test_map_points_requires_full_access(config, daemon):
         assert exc.value.code == "scope_denied"
 
 
+def test_edit_metadata_travels_the_wire(config, daemon):
+    with _client(config, "cli") as c:
+        [a] = c.remember("Dylan uses vim", scope="work")
+        mid = a.memory.id
+        edited = c.edit(mid, scope="personal", tags=["Editor", "Tools"], importance=0.9)
+        assert edited.scope == "personal"
+        assert edited.tags == ["editor", "tools"]  # lowercased, deduped
+        assert edited.importance == 0.9
+        # Text is untouched (metadata-only, no re-embed).
+        assert edited.text == "Dylan uses vim"
+        assert c.get(mid).scope == "personal"
+        # A partial edit (tags only) must not reset the other fields.
+        again = c.edit(mid, tags=["vim"])
+        assert again.importance == 0.9 and again.scope == "personal"
+
+
+def test_edit_checks_both_scopes(config, daemon):
+    ClientRegistry(config).allow("workonly", ["work"])
+    with _client(config, "cli") as c:
+        [a] = c.remember("a work fact", scope="work")
+    with _client(config, "workonly") as c:
+        # Moving OUT of an allowed scope into a forbidden one is denied.
+        with pytest.raises(ProtocolError) as exc:
+            c.edit(a.memory.id, scope="personal")
+        assert exc.value.code == "scope_denied"
+
+
 def test_no_daemon_raises_cleanly(config):
     with pytest.raises(DaemonUnavailable):
         Client(config, client_name="cli").connect(spawn=False)

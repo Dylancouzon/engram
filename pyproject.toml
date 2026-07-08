@@ -41,5 +41,11 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+# These files are mostly embedded browser assets (inline JS/CSS/HTML strings);
+# line-length limits on that content are noise, not readability.
+"src/engram/serve.py" = ["E501"]
+"src/engram/webui.py" = ["E501"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
