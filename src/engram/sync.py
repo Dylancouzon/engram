@@ -251,23 +251,29 @@ class ShardSync:
         if op != "upsert" or self.store.journal.is_tombstoned(memory_id):
             report["skipped"] += 1
             return
+        # Everything derived from the relay blob is untrusted: a peer (or a
+        # corrupt point) can plant a non-string blob, ciphertext that decrypts
+        # to a non-dict, a bad ts, or a malformed payload. Any of these must
+        # degrade to skipped, never crash and abort the whole pull.
         try:
             data = json.loads(self.fernet.decrypt(payload["blob"].encode()))
-        except (InvalidToken, KeyError, ValueError):
+            if not isinstance(data, dict):
+                raise ValueError("blob did not decrypt to an object")
+            # The authenticated identity lives inside the ciphertext.
+            if data.get("id") != memory_id or data.get("shard") != self.target.shard:
+                report["skipped"] += 1  # blob moved between ids/collections: reject
+                return
+            remote_ts = float(data.get("ts") or 0.0)
+            memory = Memory.from_payload(memory_id, data["payload"])
+        except (InvalidToken, KeyError, ValueError, TypeError, AttributeError):
             report["skipped"] += 1  # foreign key or garbage: not ours to apply
             return
-        # The authenticated identity lives inside the ciphertext.
-        if data.get("id") != memory_id or data.get("shard") != self.target.shard:
-            report["skipped"] += 1  # blob moved between ids/collections: reject
-            return
-        remote_ts = float(data.get("ts") or 0.0)
 
         owner_shard = self.store.shard_of(memory_id)
         if owner_shard is not None and owner_shard != self.target.shard:
             report["skipped"] += 1  # id already lives in another trust boundary
             return
 
-        memory = Memory.from_payload(memory_id, data["payload"])
         if self.store.apply_synced(memory, self.target.shard, remote_ts):
             report["applied"] += 1
         else:

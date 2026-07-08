@@ -37,11 +37,15 @@ REDACT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b")),
     ("url-credential", re.compile(r"(?<=://)[^/\s:@]+:([^@/\s]+)(?=@)")),
+    ("bearer-token", re.compile(r"(?i)\bBearer\s+([^\s\"']{8,})")),
     (
         "assigned-secret",
+        # Value is any run of non-whitespace, non-quote chars: a secret can
+        # hold '#', '@', or non-ASCII, so a narrow class would leak the tail
+        # (or miss the whole value) after the keyword.
         re.compile(
             r"(?i)\b(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)\b"
-            r"\s*[:=]\s*[\"']?([A-Za-z0-9!$%^&*_+/=.-]{6,})[\"']?"
+            r"\s*[:=]\s*[\"']?([^\s\"']{6,})[\"']?"
         ),
     ),
 ]
@@ -104,7 +108,7 @@ def redact(text: str, enabled: bool = True) -> RedactionResult:
             hits.append(kind)
             # Patterns with a capture group redact just the secret part
             # (e.g. the password inside a URL), keeping surrounding context.
-            partial = kind in ("url-credential", "assigned-secret")
+            partial = kind in ("url-credential", "assigned-secret", "bearer-token")
             if partial and m.groups() and m.group(1) is not None:
                 start, end = m.span(1)
                 s = m.span(0)[0]

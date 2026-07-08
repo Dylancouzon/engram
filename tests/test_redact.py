@@ -59,6 +59,23 @@ def test_assigned_password_redacted():
     assert "password" in r.text  # the label survives, the value doesn't
 
 
+def test_assigned_secret_with_special_chars_fully_redacted():
+    # '#', '@', and non-ASCII must not leak the value's tail (or the whole
+    # value): the char class after the keyword is non-whitespace, non-quote.
+    for value in ("ab#cdefghijklmno", "abcdef#ghijklmnop", "myS3cretV@lueHere",
+                  "pässw0rdXYZ123456"):
+        r = redact(_join("secret: ", value))
+        assert value not in r.text, value
+        assert "assigned-secret" in r.hits
+
+
+def test_bearer_token_redacted():
+    token = _join("a1b2c3d4", "e5f6g7h8", "i9j0k1l2m3n4")
+    r = redact(f"Authorization: Bearer {token}")
+    assert token not in r.text
+    assert "bearer-token" in r.hits
+
+
 def test_high_entropy_token_redacted():
     token = _join("x9K2mQ7pL4", "nR8vT3wY6z", "B1cD5fG0hJa")
     r = redact(f"value is {token} noted")

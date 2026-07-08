@@ -53,6 +53,15 @@ def test_cli_is_implicitly_trusted(config, daemon):
         assert hits and hits[0].memory.text == "Dylan's cat is named Miso"
 
 
+def test_stats_reports_daemon_model_availability(config, daemon):
+    # The hook-capture skip-without-a-model gate relies on stats() being
+    # symmetric across the client boundary: a client must see the daemon's
+    # model state, or raw transcript tails get stored as "memories" whenever
+    # the daemon has no extraction model. (daemon fixture runs with llm=None.)
+    with _client(config, "cli") as c:
+        assert c.stats()["extraction"] == "verbatim fallback"
+
+
 def test_unregistered_client_denied_with_hint(config, daemon):
     with _client(config, "surprise-app") as c:
         with pytest.raises(ProtocolError) as exc:

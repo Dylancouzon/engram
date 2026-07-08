@@ -14,6 +14,20 @@ def test_append_and_pending(tmp_path):
     assert j.pending() == []
 
 
+def test_tombstone_shard_survives_export_import(tmp_path):
+    # A tombstone in a synced shard must keep its shard across export/import,
+    # or sync stops re-propagating the deletion after a migrate.
+    src = Journal(tmp_path / "src.db")
+    src.add_tombstone("id-shared", "shared:team")
+    buf = io.StringIO()
+    src.export_jsonl(buf)
+    buf.seek(0)
+    dst = Journal(tmp_path / "dst.db")
+    dst.import_jsonl(buf)
+    assert dst.tombstones(shard="shared:team") == {"id-shared"}
+    assert dst.tombstones(shard="private") == set()
+
+
 def test_idempotency_key_dedups(tmp_path):
     j = Journal(tmp_path / "j.db")
     s1 = j.append("upsert", "id-1", {"text": "x"}, idempotency_key="k1")

@@ -425,6 +425,7 @@ class MemoryStore:
                 "noop",
                 verdict.target.id,
                 {"dropped_text": fact.text, "confidence": verdict.confidence},
+                shard=shard,
             )
             # A noop has no Edge effect, so it is durable the moment it's in
             # the journal: advance both marks past it immediately.
@@ -871,6 +872,7 @@ class MemoryStore:
             resolved_seq = self.journal.append(
                 "review_resolved", item.new.id,
                 {"review_seq": seq, "accepted": accept},
+                shard=item.shard,
             )
             self._applied_seq = max(self._applied_seq, resolved_seq)
             self._mark_flushed(resolved_seq)

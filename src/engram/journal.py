@@ -358,8 +358,12 @@ class Journal:
         for entry in self.entries():
             fp.write(entry.to_json() + "\n")
             n += 1
-        for tid in sorted(self.tombstones()):
-            fp.write(json.dumps({"op": "tombstone", "memory_id": tid}) + "\n")
+        with self._lock:
+            rows = sorted(self._conn.execute(
+                "SELECT memory_id, shard FROM tombstones"))
+        for tid, tshard in rows:
+            fp.write(json.dumps(
+                {"op": "tombstone", "memory_id": tid, "shard": tshard}) + "\n")
             n += 1
         return n
 
@@ -376,8 +380,9 @@ class Journal:
                 row = json.loads(line)
                 if row.get("op") == "tombstone":
                     self._conn.execute(
-                        "INSERT OR REPLACE INTO tombstones (memory_id, ts) VALUES (?, ?)",
-                        (row["memory_id"], time.time()),
+                        "INSERT OR REPLACE INTO tombstones (memory_id, ts, shard) "
+                        "VALUES (?, ?, ?)",
+                        (row["memory_id"], time.time(), row.get("shard", "private")),
                     )
                 else:
                     payload = row.get("payload")

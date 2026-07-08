@@ -746,9 +746,11 @@ def hook_capture(data_dir: str | None, scope: str, max_chars: int) -> None:
     if len(tail) < 40:
         return
     with _open_surface(data_dir) as store:
-        llm = getattr(store, "llm", None)
-        if (llm is None or not llm.available()) and isinstance(store, MemoryStore):
-            return  # library mode without a model: skip, never store blobs
+        # Skip when no extraction model is reachable, in both library and
+        # daemon mode — else raw transcript tails land verbatim as "memories".
+        # stats()["extraction"] proxies through the daemon, so it's symmetric.
+        if store.stats().get("extraction") != "ollama":
+            return
         actions = store.remember(tail, scope=scope, surface="auto-capture",
                                  source_ref=str(transcript_path))
         store.log_event("auto-capture", hits=len(actions))

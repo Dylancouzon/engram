@@ -181,6 +181,39 @@ def test_relay_cannot_swap_blob_between_ids(tmp_path, cloud):
         b.close()
 
 
+def test_malformed_relay_payload_skipped_not_crash(tmp_path, cloud):
+    import json as _json
+
+    from cryptography.fernet import Fernet
+    from qdrant_client import models as qm
+    a = _device(tmp_path, "device-a")
+    b = _device(tmp_path, "device-b", key_from=a.config)
+    try:
+        [act] = a.remember("Dylan's cat is named Miso", shard="me-synced")
+        sync_shard(a, "me-synced", client=cloud)
+        # A peer (no key needed for the first, key needed for the second)
+        # plants garbage: a non-string blob, and ciphertext that decrypts to
+        # a non-dict. Neither may abort the pull or drop the genuine record.
+        key = (a.config.data_dir / "sync.key").read_bytes().strip()
+        list_blob = Fernet(key).encrypt(_json.dumps(["not", "a", "dict"]).encode()).decode()
+        cloud.upsert("engram-me-synced", points=[
+            qm.PointStruct(id="00000000-0000-4000-8000-000000000111",
+                vector={"relay": [0.0]},
+                payload={"op": "upsert", "blob": 12345, "ts": 9e9, "device": "evil"}),
+            qm.PointStruct(id="00000000-0000-4000-8000-000000000222",
+                vector={"relay": [0.0]},
+                payload={"op": "upsert", "blob": list_blob, "ts": 9e9, "device": "evil"}),
+        ])
+        report = sync_shard(b, "me-synced", client=cloud)  # must not raise
+        assert b.get(act.memory.id) is not None  # genuine record still applied
+        assert b.get("00000000-0000-4000-8000-000000000111") is None
+        assert b.get("00000000-0000-4000-8000-000000000222") is None
+        assert report["skipped"] >= 2
+    finally:
+        a.close()
+        b.close()
+
+
 def test_unknown_tombstone_is_recorded(tmp_path, cloud):
     a = _device(tmp_path, "device-a")
     b = _device(tmp_path, "device-b", key_from=a.config)
