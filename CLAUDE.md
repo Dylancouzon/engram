@@ -14,7 +14,7 @@ not break, and the traps already discovered. Full original spec:
 ## Status: M0–M3 complete
 
 All four milestones built, reviewed (Codex + andrey-review adversarial passes,
-all findings fixed), and validated with real models. **102 tests green**, ruff
+all findings fixed), and validated with real models. **133 tests green**, ruff
 clean. Golden set: **84% op accuracy, 100% recall accuracy** (misses are the
 safe direction: mostly degrade-to-ADD, plus a couple NOOP→UPDATE — never a
 wrongful supersede or a lost recall). ~4500 LOC source.
@@ -37,6 +37,40 @@ knob, and `hook print-config`. Distribution name is now **qdrant-engram**
 (PyPI `engram` is squatted and the name collides with several AI-memory
 projects); the CLI/module stay `engram`. Packaging (uvx/plugin-marketplace/
 .mcpb) is deliberately parked until Dylan has dogfooded.
+
+A serve + durability pass added `engram serve` (an interactive local web app
+over the store — manage, chat, and trigger consolidation, surfaced there as
+**Dream**; the dashboard map was deduped into shared `webui.init_map`), real
+disk-usage in `stats`, and dropped unused payload indexes. It also closed an
+apply-failure durability gap: if a journaled write's Edge-apply raises after
+the ack, `_apply_guard` sets `_flush_damaged` and `_mark_flushed` freezes the
+high-water mark, so replay-on-open (or a rebuild) refills the gap instead of
+skipping it forever.
+
+A stress-test hardening pass (Sonnet bug-hunt across four subsystems + two
+Codex adversarial passes) fixed eight issues in two batches. **Robustness:**
+(1) redaction leaked a secret value's tail (or missed it entirely) when it
+held `#`, `@`, a space, or non-ASCII — the `assigned-secret` value class is
+now non-whitespace/non-quote, plus a `Bearer <token>` rule; (2) `hook capture`
+stored raw transcript tails as memories in daemon mode when no model was
+reachable (the old `isinstance(store, MemoryStore)` guard is always false for a
+`Client` — now gates on `stats()["extraction"]`, symmetric across the daemon);
+(3) a malformed relay point (non-string blob, ciphertext decrypting to a
+non-dict, bad ts) crashed and aborted a whole `sync now` pull — now degrades to
+skipped; (4) export/import collapsed every tombstone's shard to `private`,
+breaking sync re-propagation after a migrate; (5) `noop`/`review_resolved`
+rows were mistagged `private`. **Durability (Codex-reviewed twice):**
+(6) accepting an ambiguous UPDATE review left the ADDed twin's verbatim text in
+an exportable, un-forgettable journal row — now the merged target commits
+first, then the twin is byte-purged (its `review` row goes with it, so no
+`review_resolved` marker is written under the tombstoned twin id); (7) the
+global flush high-water mark could advance past a deferred reinforcement only
+one shard had flushed (`_dirty_shards` are now flushed before `_mark_flushed`
+advances); (8) consolidation held the write lock across its summarization LLM
+call, so daemon shutdown could block ~60s — consolidation is now two-phase
+(gather under the lock, model calls lock-free, apply under the lock with a
+strict re-validation that discards any summary whose source episodes were
+changed or forgotten mid-run, so forgotten content can't reappear).
 
 Not built (deliberate cuts, not omissions): Wave-C/D ingestion adapters
 (email/messages/voice/CLIP) — the adapter *contract* is documented in
@@ -279,7 +313,8 @@ model downloads; sync tests use `QdrantClient(":memory:")` as the relay.
   needs Ollama for non-ADD ops)
 - `uv run ruff check src tests`
 - `uv run engram --help` — CLI. Key verbs: `remember/recall/forget`,
-  `list/log/dashboard` (transparency surface), `review`, `seed <files|dirs>`,
+  `list/log/dashboard` (transparency surface), `serve` (interactive local web
+  app), `review`, `seed <files|dirs>`,
   `export/import`, `snapshot/restore`, `sync setup/now`, `consolidate`,
   `daemon [--install]`, `clients allow/revoke/list`, `hook
   install|session-start|user-prompt|capture`, `rules <surface>`, `mcp
@@ -334,6 +369,33 @@ model downloads; sync tests use `QdrantClient(":memory:")` as the relay.
 - **Test secret fixtures** must be runtime-assembled from fragments, or
   GitGuardian flags them (it did, on commit ff5790d — those are false
   positives; assembly since 71fd366).
+- **The `assigned-secret` value class must stay broad** (non-whitespace,
+  non-quote). A narrow character class leaks a secret's tail after the first
+  `#`/`@`/space/non-ASCII char — or fails to match at all, storing the whole
+  value in cleartext. The keyword (`password:`/`token=`/`Bearer`) is the
+  signal; capture the value greedily to whitespace.
+- **Never gate on `isinstance(store, MemoryStore)` to detect library vs daemon
+  mode** — a daemon `Client` is not a `MemoryStore`, so the branch silently
+  flips. To read the daemon's model/config state from either surface, call
+  `store.stats()` (the `Client` proxies it through the daemon).
+- **The flush high-water mark is global; `flush()` is per-shard.** Any write
+  that mutates a shard without flushing it (only deferred reinforcement, today)
+  must register the shard in `_dirty_shards` so `_mark_flushed` flushes it
+  before advancing the mark — else a later write on another shard strands the
+  bump past the mark and replay skips it. Discard a shard from `_dirty_shards`
+  only after its flush succeeds; a failed flush freezes the mark.
+- **Accepting an UPDATE review byte-purges the twin** (commit the merged
+  target first, then `_forget_locked(twin, "hard")`). Do NOT append a
+  `review_resolved` row for the UPDATE case — the `review` row is keyed under
+  the twin id and is purged with it, so writing one would re-add a journal row
+  under a now-tombstoned id.
+- **Consolidation must not hold `_write_lock` across a model call** — a daemon
+  shutdown waits on that lock and would block a full Ollama timeout. It runs in
+  three phases (gather under the lock, model calls lock-free, apply under the
+  lock). On apply, re-validate each source episode against its phase-1 text: if
+  any was forgotten, invalidated, edited, or newly protected mid-run, discard
+  the whole summary — a summary built from now-forgotten text would otherwise
+  re-journal that content after `forget` returned.
 
 ## Working rules for this repo
 

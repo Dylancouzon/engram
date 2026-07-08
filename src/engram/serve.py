@@ -41,7 +41,7 @@ from engram.llm import LocalLLM
 from engram.protocol import ProtocolError, memory_to_wire, review_to_wire
 from engram.webui import MAP_JS, THEME_CSS
 
-CONSOLIDATE_TIMEOUT = 600.0  # the dream/consolidation pass holds the write lock through LLM calls
+CONSOLIDATE_TIMEOUT = 600.0  # the dream/consolidation pass runs many sequential model calls
 
 
 def serve(config: Config, port: int = 0, open_browser: bool = True) -> None:
