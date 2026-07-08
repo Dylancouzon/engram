@@ -2,7 +2,7 @@
 
 Unlike `engram dashboard` (a static file, no process, no port), this runs a
 small HTTP server so you can manage memories, chat with the local model
-about them, and trigger the sleep pass — none of which a static file can do.
+about them, and trigger the dream (consolidation) pass — none of which a static file can do.
 
 Trust model (read before touching auth):
 - Any process running as you can already reach the 0600 daemon socket and act
@@ -41,7 +41,7 @@ from engram.llm import LocalLLM
 from engram.protocol import ProtocolError, memory_to_wire, review_to_wire
 from engram.webui import MAP_JS, THEME_CSS
 
-CONSOLIDATE_TIMEOUT = 600.0  # the sleep pass holds the write lock through LLM calls
+CONSOLIDATE_TIMEOUT = 600.0  # the dream/consolidation pass holds the write lock through LLM calls
 
 
 def serve(config: Config, port: int = 0, open_browser: bool = True) -> None:
@@ -339,6 +339,8 @@ button.act:hover { border-color: var(--accent); }
 button.act:disabled { opacity: 0.5; cursor: default; }
 button.act.pri { background: var(--accent); color: #1a1206; border-color: var(--accent); font-weight: 600; }
 .stage { position: relative; display: grid; grid-template-columns: 1fr 380px; min-height: 0; }
+.stage.docs-view { grid-template-columns: 1fr; }
+.stage.docs-view #mapcol { display: none; }
 #map { display: block; width: 100%; height: 100%; cursor: grab; background:
   radial-gradient(120% 120% at 30% 20%, color-mix(in srgb, var(--accent) 6%, transparent), transparent 60%); }
 .maptools { position: absolute; top: 0.7rem; left: 0.7rem; display: flex; gap: 0.4rem; align-items: center; }
@@ -387,12 +389,33 @@ textarea#add { width: 100%; min-height: 3.4rem; resize: vertical; background: va
 .chatbar { display: flex; gap: 0.4rem; padding: 0.6rem; border-top: 1px solid var(--line); }
 .chatbar input { flex: 1; background: var(--bg); color: var(--ink); border: 1px solid var(--line);
   border-radius: 7px; padding: 0.45rem 0.6rem; font: inherit; }
-.docs { font-size: 0.82rem; line-height: 1.55; }
-.docs h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-3);
-  margin: 1rem 0 0.35rem; }
+.docs { font-size: 0.9rem; line-height: 1.6; padding: 1rem 2rem 4rem; }
+.docs .lead { font-size: 1rem; color: var(--ink-2); margin-bottom: 0.5rem; }
+.docs h2 { font-size: 1.15rem; font-weight: 660; letter-spacing: -0.01em; color: var(--ink);
+  margin: 2rem 0 0.5rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+.docs h2:first-of-type { border-top: none; padding-top: 0; }
+.docs h3 { font-size: 0.85rem; color: var(--ink); margin: 1rem 0 0.35rem; font-weight: 620; }
 .docs code { font-family: ui-monospace, Menlo, monospace; background: var(--surface-2);
-  border: 1px solid var(--line); border-radius: 4px; padding: 0 0.3rem; font-size: 0.9em; }
-.docs p { margin-bottom: 0.5rem; }
+  border: 1px solid var(--line); border-radius: 4px; padding: 0 0.3rem; font-size: 0.88em; }
+.docs p { margin-bottom: 0.6rem; }
+.docs b { color: var(--ink); }
+/* inline flow diagrams — theme-aware boxes + arrows, no images */
+.diagram { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0.9rem 0;
+  padding: 1rem; background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; }
+.diagram.col { flex-direction: column; align-items: stretch; }
+.diagram.wide .node { flex: 1; }
+.node { background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  padding: 0.5rem 0.7rem; font-size: 0.8rem; text-align: center; }
+.node b { display: block; color: var(--ink); }
+.node small { color: var(--ink-3); font-size: 0.72rem; line-height: 1.35; }
+.node.key { border-color: var(--accent); }
+.arrow { color: var(--accent); font-size: 1.1rem; text-align: center; }
+.row { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.row .node { flex: 1; min-width: 6rem; }
+.four { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem; }
+.four .node { text-align: left; }
+.fanin { display: flex; gap: 0.4rem; flex-wrap: wrap; justify-content: center; }
+.fanin .node { font-size: 0.74rem; padding: 0.35rem 0.55rem; }
 .toast { position: fixed; bottom: 1rem; left: 50%; transform: translateX(-50%); background: var(--ink);
   color: var(--bg); padding: 0.4rem 0.8rem; border-radius: 7px; font-size: 0.8rem; opacity: 0;
   transition: opacity 0.15s; z-index: 20; }
@@ -405,10 +428,10 @@ textarea#add { width: 100%; min-height: 3.4rem; resize: vertical; background: va
     <h1>engram<span class="dot">.</span></h1>
     <span class="stat" id="hstat">loading…</span>
     <span class="grow"></span>
-    <button class="act" id="sleep" title="Run the idle consolidation pass now">Sleep now</button>
+    <button class="act" id="dream" title="Consolidate memories now — prune, dedupe, summarize (like dreaming)">Dream</button>
   </header>
   <div class="stage">
-    <div style="position:relative">
+    <div id="mapcol" style="position:relative">
       <canvas id="map"></canvas>
       <div class="maptools">
         <span class="chip" data-mode="scope">scope</span>
@@ -442,7 +465,106 @@ textarea#add { width: 100%; min-height: 3.4rem; resize: vertical; background: va
           </div>
         </div>
       </div>
-      <div class="tabbody docs" data-body="docs" hidden></div>
+      <div class="tabbody docs" data-body="docs" hidden>
+        <p class="lead">A private memory for your AI assistants. Everything it knows lives in
+          one folder on this machine (<code>~/.engram</code>). Nothing is sent anywhere.</p>
+
+        <h2>The core idea: a logbook and a search index</h2>
+        <p>engram keeps two things that work together:</p>
+        <div class="diagram col">
+          <div class="node key"><b>The journal — the source of truth</b>
+            <small>every memory, saved as plain text, in the order it happened</small></div>
+          <div class="arrow">↑ rebuilt from ↑</div>
+          <div class="node"><b>The search index</b>
+            <small>finds memories fast; can always be rebuilt from the journal</small></div>
+        </div>
+        <p>The journal is what's real. The index is a convenience on top of it — if it's ever
+          lost or corrupted, engram rebuilds it from the journal. That's why your memory is safe.</p>
+
+        <h2>One writer, many ways in</h2>
+        <div class="diagram col">
+          <div class="fanin">
+            <div class="node">CLI</div><div class="node">Your AI app (MCP)</div>
+            <div class="node">This app</div><div class="node">Editor hooks</div>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node key"><b>The daemon</b><small>the one process allowed to write</small></div>
+        </div>
+        <p>A single background process is the only thing that changes your memory. Every tool
+          talks to it, so your data stays consistent no matter how many tools you use.</p>
+
+        <h2>Saving a memory</h2>
+        <div class="diagram row wide">
+          <div class="node"><b>Text</b></div><div class="arrow">→</div>
+          <div class="node"><b>Scrub</b><small>secrets removed before anything is stored</small></div>
+          <div class="arrow">→</div>
+          <div class="node"><b>Extract</b><small>one clear fact per memory</small></div>
+          <div class="arrow">→</div>
+          <div class="node"><b>Decide</b><small>how does it fit what's known?</small></div>
+          <div class="arrow">→</div>
+          <div class="node"><b>Save</b></div>
+        </div>
+        <h3>The decision — four outcomes</h3>
+        <div class="diagram four">
+          <div class="node"><b>Add</b><small>brand-new fact → stored</small></div>
+          <div class="node"><b>Update</b><small>same fact, more detail → merged in</small></div>
+          <div class="node"><b>Replace</b><small>contradicts an old fact → old one retired</small></div>
+          <div class="node"><b>Skip</b><small>already known → nothing to do</small></div>
+        </div>
+        <p>A local model makes this call. When it's unsure it plays safe: it just <b>adds</b> and
+          flags the memory for you to review. A wrong add is easy to undo; a wrong delete isn't.</p>
+
+        <h2>Remembering (recall)</h2>
+        <div class="diagram row wide">
+          <div class="node"><b>Your question</b></div><div class="arrow">→</div>
+          <div class="node"><b>Find</b><small>by meaning + by keyword</small></div>
+          <div class="arrow">→</div>
+          <div class="node"><b>Rank</b><small>best match, plus how recent and how important</small></div>
+          <div class="arrow">→</div>
+          <div class="node"><b>Top memories</b></div>
+        </div>
+        <p><b>By meaning</b> is vector search: your text becomes a list of numbers (an
+          <b>embedding</b>), and memories whose numbers are close mean similar things — even in
+          different words. <b>By keyword</b> catches exact terms. The two are blended, then
+          re-ranked so fresher and more important memories rise.</p>
+
+        <h2>The map</h2>
+        <p>Every memory is a point placed by meaning — close points are related. Color is the
+          scope (or type), and points fade as they age. It's a picture of everything engram knows
+          about you. Scroll to zoom, drag to pan, hover to read, click to jump to a memory.</p>
+
+        <h2>Scopes: private, synced, shared</h2>
+        <div class="diagram row">
+          <div class="node key"><b>private</b><small>stays on this machine (default)</small></div>
+          <div class="node"><b>me-synced</b><small>your own devices, encrypted</small></div>
+          <div class="node"><b>shared:team</b><small>opt-in pools you choose</small></div>
+        </div>
+        <p>Private is the default and never leaves the machine. Sync is opt-in and
+          end-to-end encrypted — the relay only ever sees ciphertext.</p>
+
+        <h2>Proactive recall</h2>
+        <p>engram doesn't wait to be asked. Editor hooks surface the right memories the moment
+          you start typing a prompt, and quietly capture new ones from your sessions — so the
+          model remembers at the right time without you managing it.</p>
+
+        <h2>Dream (memory consolidation)</h2>
+        <p>Like a brain consolidating in sleep. When idle (or when you press <b>Dream</b>) engram
+          tidies up: it drops stale one-off notes, merges duplicates, and summarizes clusters of
+          old events into a single lasting fact. Writes pause while it runs.</p>
+
+        <h2>What's yours</h2>
+        <p>The folder is yours. Copy it to another machine and your memory moves with it. Export
+          it to plain text anytime. Forget a memory and it's gone — the bytes are purged, not
+          just hidden.</p>
+
+        <h2>This app vs. <code>engram dashboard</code></h2>
+        <p>This app (<code>engram serve</code>) is live: manage, chat, and dream. It runs a small
+          server on your machine until you stop it. <code>engram dashboard</code> is a static
+          snapshot — no server, nothing left running — for a quick private look.</p>
+        <p><b>Commands:</b> <code>remember</code> · <code>recall</code> · <code>forget</code> ·
+          <code>list</code> · <code>review</code> · <code>consolidate</code> ·
+          <code>dashboard</code> · <code>serve</code> — <code>engram --help</code> for all.</p>
+      </div>
     </div>
   </div>
 </div>
@@ -533,11 +655,11 @@ $("#addbtn").onclick = async () => {
   await api("/api/remember", { text, scope: $("#addscope").value.trim() || "default" });
   $("#add").value = ""; toast("remembered"); await load();
 };
-$("#sleep").onclick = async () => {
-  const b = $("#sleep"); b.disabled = true; b.textContent = "Sleeping… (writes pause)";
+$("#dream").onclick = async () => {
+  const b = $("#dream"); b.disabled = true; b.textContent = "Dreaming… (writes pause)";
   try { const r = await api("/api/consolidate", {});
-    toast(`slept: ${r.pruned} pruned, ${r.deduped} deduped, ${r.summarized} summarized`); await load(); }
-  finally { b.disabled = false; b.textContent = "Sleep now"; }
+    toast(`dreamed: ${r.pruned} pruned, ${r.deduped} deduped, ${r.summarized} summarized`); await load(); }
+  finally { b.disabled = false; b.textContent = "Dream"; }
 };
 
 // map highlight box
@@ -547,6 +669,9 @@ $("#mapq").addEventListener("input", e => { if (MAP) MAP.setFilter(e.target.valu
 function switchTab(name) {
   document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === name));
   document.querySelectorAll(".tabbody").forEach(x => x.hidden = x.dataset.body !== name);
+  // Docs takes the whole stage; leaving it, re-fit the map to its box.
+  document.querySelector(".stage").classList.toggle("docs-view", name === "docs");
+  if (name !== "docs") window.dispatchEvent(new Event("resize"));
 }
 document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => switchTab(b.dataset.tab));
 
@@ -581,26 +706,6 @@ async function sendChat() {
 }
 $("#chatsend").onclick = sendChat;
 $("#chatin").addEventListener("keydown", e => { if (e.key === "Enter") sendChat(); });
-
-$(".docs").innerHTML = `
-  <h3>What this is</h3>
-  <p>A private, local memory for your AI assistants. Your memories live in a folder you
-  own (<code>~/.engram</code>); nothing leaves this machine.</p>
-  <h3>How it works</h3>
-  <p>A SQLite <b>journal</b> is the source of truth; the vector index (Qdrant Edge) is a
-  rebuildable projection over it. On write, text is redacted, facts extracted, and a local
-  model decides add / update / supersede / noop against what's already known.</p>
-  <p>The <b>map</b> plots every memory by meaning — nearby dots are semantically similar.
-  Color is scope or type; dots fade with age. Scroll to zoom, drag to pan, hover to read.</p>
-  <h3>This app</h3>
-  <p><b>Chat</b> answers from your memories (the ones it used light up on the map).
-  <b>Sleep now</b> runs consolidation: prune stale episodes, dedupe, summarize — writes
-  pause while it runs. Edit scope/tags/importance inline; a text correction is a new
-  <code>remember</code> (the model supersedes the old one).</p>
-  <h3>Commands</h3>
-  <p><code>engram remember</code> · <code>recall</code> · <code>forget</code> ·
-  <code>list</code> · <code>review</code> · <code>consolidate</code> ·
-  <code>dashboard</code> (static) · <code>serve</code> (this) · <code>--help</code> for all.</p>`;
 
 load();
 </script>
