@@ -44,9 +44,19 @@ _SHARD_NAME = re.compile(r"^(private|me-synced|shared:[a-z0-9_-]{1,32})$")
 
 
 def _dir_size(path: Path) -> int:
+    """Actual blocks on disk, not apparent size. Edge's payload-index and
+    segment files are sparse (mmap-backed, allocated far larger than they
+    are written), so summing st_size over-reports the footprint severalfold —
+    st_blocks is the real allocation. Falls back to st_size where st_blocks
+    is unavailable (non-POSIX)."""
     if not path.exists():
         return 0
-    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+    total = 0
+    for p in path.rglob("*"):
+        if p.is_file():
+            st = p.stat()
+            total += getattr(st, "st_blocks", 0) * 512 or st.st_size
+    return total
 
 
 def _human_size(n: int) -> str:

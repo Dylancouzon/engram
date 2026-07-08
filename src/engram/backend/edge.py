@@ -46,7 +46,11 @@ DENSE = "dense"
 SPARSE = "sparse"
 
 _KEYWORD_INDEXES = ("type", "scope", "tags")
-_FLOAT_INDEXES = ("created_at", "valid_from", "valid_to", "importance")
+# Only fields used as query pre-filters get an index. valid_from/valid_to gate
+# every recall (temporal validity); created_at and importance feed the app-side
+# rescore straight from the payload and are never filtered on, so indexing them
+# was pure per-field allocation + write overhead.
+_FLOAT_INDEXES = ("valid_from", "valid_to")
 
 
 @dataclass
