@@ -1,10 +1,10 @@
 """Store pipeline + the three M0 exit tests (spec §9)."""
 
 import pytest
-from conftest import FakeLLM, make_store
+from conftest import FakeEmbedder, FakeLLM, make_store
 
 from engram.models import Op
-from engram.store import StoreLockedError, WriteRefusedError
+from engram.store import MemoryStore, StoreLockedError, WriteRefusedError
 
 
 def test_remember_and_recall(store):
@@ -201,7 +201,62 @@ def test_hard_forget_is_gone_everywhere(config):
     assert b"SSN ends in" not in config.journal_path.read_bytes()
 
 
+def test_hard_forget_purges_target_content_in_review_rows(config):
+    """A review row is keyed by the NEW memory's id but its merged_text carries
+    the TARGET's content. Hard-forgetting the target must purge those rows too,
+    or the bytes survive in the log."""
+    llm = FakeLLM(judge_responses=[
+        {"op": "UPDATE", "target": 0, "confidence": 0.6,
+         "text": "Dylan lives in Berlin ZZSECRETZZ"}])
+    store = make_store(config, llm=llm)
+    try:
+        [a] = store.remember("Dylan lives in Paris")
+        store.remember("Dylan lives in Berlin now")  # judged UPDATE, low conf -> queued
+        assert store.pending_reviews(), "expected an ambiguous UPDATE to queue"
+        store.forget(a.memory.id, mode="hard")
+    finally:
+        store.close()
+    assert b"ZZSECRETZZ" not in config.journal_path.read_bytes()
+
+
 # --- durability -------------------------------------------------------------------
+
+
+def test_mid_write_apply_failure_not_sealed_by_later_write(config):
+    """A write acked to the journal whose Edge apply then raises must not be
+    sealed under the flush high-water mark by a later successful write — Edge
+    never replays its WAL, so replay-on-open is the only thing that refills the
+    gap, and an advanced mark would hide it forever."""
+
+    class FailOnPoison(FakeEmbedder):
+        def embed_documents(self, texts):
+            if any("POISON" in t for t in texts):
+                raise RuntimeError("edge apply blew up")
+            return super().embed_documents(texts)
+
+    store = MemoryStore(config, embedder=FailOnPoison(), llm=None)
+    with pytest.raises(RuntimeError):
+        store.remember("POISON pill about the Berlin flight on Friday")
+    assert store._flush_damaged  # the gap is recorded
+    # A later write succeeds but must NOT advance the mark past the gap.
+    store.remember("Dylan uses uv for Python packaging")
+    # Abandon the way a dead process would (no clean close/rebuild).
+    store.journal.close()
+    for b in store.backends.values():
+        b.close()
+    import fcntl
+
+    fcntl.flock(store._lock_file, fcntl.LOCK_UN)
+    store._lock_file.close()
+
+    reopened = make_store(config)  # healthy embedder; replay refills the gap
+    try:
+        assert any("POISON" in h.memory.text
+                   for h in reopened.recall("Berlin flight Friday"))
+        assert any("uv" in h.memory.text
+                   for h in reopened.recall("python packaging"))
+    finally:
+        reopened.close()
 
 
 def test_crash_after_ack_before_flush_replays(config):

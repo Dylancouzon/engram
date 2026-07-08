@@ -205,6 +205,16 @@ class MemoryStore:
                 LocalLLM(cfg.ollama_url, cfg.extraction_model) if llm == "auto" else llm
             )
             self.backends: dict[str, EdgeBackend] = {}
+            # Set when a post-ack Edge apply fails mid-session: the journal has
+            # rows Edge doesn't. While set, the flush mark is frozen so a later
+            # successful write can't seal the gap; replay/rebuild refills it and
+            # clears the flag. See _mark_flushed.
+            self._flush_damaged = False
+            # Bumped only when the map's (id, vector) set changes; the O(n^2)
+            # projection is memoized against it so a metadata edit or review
+            # resolution doesn't recompute the whole map on every serve refresh.
+            self._map_epoch = 0
+            self._map_cache: tuple[int, int, list[dict]] | None = None
             if self._purge_marker.exists():
                 # A hard-forget purge (or its recovery) was interrupted. The
                 # journal is already clean, so rebuild the index from it.
@@ -278,6 +288,27 @@ class MemoryStore:
         self._backend("private")
         self.rebuild(wipe=False)  # shards were just wiped
         self._purge_marker.unlink()
+
+    def _mark_flushed(self, seq: int) -> None:
+        """Advance the durable high-water mark — unless a post-ack apply failed
+        this session (_flush_damaged). Edge does not replay its WAL, so once a
+        write's journal row is acked but its Edge apply raised, marking any
+        later seq flushed would hide the gap from replay forever. Freezing the
+        mark keeps replay-on-open (or a rebuild) honest until the gap is
+        refilled."""
+        if not self._flush_damaged:
+            self.journal.mark_flushed(seq)
+
+    @contextmanager
+    def _apply_guard(self):
+        """Wrap the Edge-apply phase that follows a journal append. On failure
+        the journal holds rows Edge may not, so freeze the flush mark until a
+        replay/rebuild refills the gap."""
+        try:
+            yield
+        except BaseException:
+            self._flush_damaged = True
+            raise
 
     # -- write ---------------------------------------------------------------
 
@@ -398,7 +429,7 @@ class MemoryStore:
             # A noop has no Edge effect, so it is durable the moment it's in
             # the journal: advance both marks past it immediately.
             self._applied_seq = max(self._applied_seq, noop_seq)
-            self.journal.mark_flushed(noop_seq)
+            self._mark_flushed(noop_seq)
             self._reinforce([verdict.target.id])
             return WriteAction(op=Op.NOOP, memory=None, target=verdict.target,
                                confidence=verdict.confidence)
@@ -462,7 +493,7 @@ class MemoryStore:
                 shard=shard,
             )
             self._applied_seq = max(self._applied_seq, seq)
-            self.journal.mark_flushed(seq)  # no Edge effect; durable at append
+            self._mark_flushed(seq)  # no Edge effect; durable at append
         return WriteAction(op=Op.ADD, memory=new, confidence=verdict.confidence,
                            queued_review=queue)
 
@@ -477,12 +508,14 @@ class MemoryStore:
             intents.append(("upsert", m.id, payload, key))
         last_seq = self.journal.append_many(intents, shard=shard)[-1]  # <- the ack point
 
-        embedded = self.embedder.embed_documents([m.text for m in memories])
-        for m, emb in zip(memories, embedded, strict=True):
-            backend.upsert(m, emb)
-        self._applied_seq = max(self._applied_seq, last_seq)
-        backend.flush()
-        self.journal.mark_flushed(self._applied_seq)
+        with self._apply_guard():
+            embedded = self.embedder.embed_documents([m.text for m in memories])
+            for m, emb in zip(memories, embedded, strict=True):
+                backend.upsert(m, emb)
+            self._applied_seq = max(self._applied_seq, last_seq)
+            backend.flush()
+        self._mark_flushed(self._applied_seq)
+        self._map_epoch += 1
 
     # -- read ------------------------------------------------------------------
 
@@ -596,6 +629,11 @@ class MemoryStore:
         """
         import numpy as np
 
+        epoch = self._map_epoch
+        cache = self._map_cache
+        if cache is not None and cache[0] == epoch and cache[1] == neighbors:
+            return cache[2]
+
         ids: list[str] = []
         vecs: list[list[float]] = []
         with self._shard_guard.shared():
@@ -624,11 +662,15 @@ class MemoryStore:
         k = min(neighbors, len(ids) - 1)
         nbr = np.argsort(-sim, axis=1)[:, :k] if k > 0 else np.empty((len(ids), 0), int)
 
-        return [
+        points = [
             {"id": pid, "x": float(coords[i, 0]), "y": float(coords[i, 1]),
              "neighbors": [ids[j] for j in nbr[i]]}
             for i, pid in enumerate(ids)
         ]
+        # Cache under the epoch sampled BEFORE the scan: if a write bumped it
+        # mid-compute, the mismatch forces a recompute next call (never stale).
+        self._map_cache = (epoch, neighbors, points)
+        return points
 
     def edit_metadata(self, memory_id: str, *, scope: str | None = None,
                       tags: list[str] | None = None,
@@ -659,10 +701,11 @@ class MemoryStore:
                 m.importance = max(0.0, min(1.0, float(importance)))
             payload = m.to_payload()
             seq = self.journal.append("upsert", m.id, payload, shard=shard)
-            self._backend(shard).set_payload(m.id, payload)
-            self._applied_seq = max(self._applied_seq, seq)
-            self._backend(shard).flush()
-            self.journal.mark_flushed(self._applied_seq)
+            with self._apply_guard():
+                self._backend(shard).set_payload(m.id, payload)
+                self._applied_seq = max(self._applied_seq, seq)
+                self._backend(shard).flush()
+            self._mark_flushed(self._applied_seq)
             return m
 
     def _reinforce(self, memory_ids: list[str]) -> None:
@@ -699,8 +742,9 @@ class MemoryStore:
             count = int(hit.payload.get("access_count") or 0) + n
             partial = {"access_count": count, "last_accessed": now}
             seq = self.journal.reinforce(mid, partial, shard=shard)
-            self._backend(shard).set_payload(mid, partial)
-            self._applied_seq = max(self._applied_seq, seq)
+            with self._apply_guard():
+                self._backend(shard).set_payload(mid, partial)
+                self._applied_seq = max(self._applied_seq, seq)
 
     # -- forget ------------------------------------------------------------------
 
@@ -724,10 +768,11 @@ class MemoryStore:
             memory.valid_to = now_ts()
             payload = memory.to_payload()
             seq = self.journal.append("upsert", memory.id, payload, shard=owner_shard)
-            backend.set_payload(memory.id, {"valid_to": memory.valid_to})
-            self._applied_seq = max(self._applied_seq, seq)
-            backend.flush()
-            self.journal.mark_flushed(self._applied_seq)
+            with self._apply_guard():
+                backend.set_payload(memory.id, {"valid_to": memory.valid_to})
+                self._applied_seq = max(self._applied_seq, seq)
+                backend.flush()
+            self._mark_flushed(self._applied_seq)
             return memory
 
         # hard. Deleting the point from Edge is not enough: delete+flush
@@ -762,7 +807,8 @@ class MemoryStore:
                 new_backend.upsert_raw(point_id, vector, payload)
             self._applied_seq = self.journal.last_seq
             new_backend.flush()
-            self.journal.mark_flushed(self._applied_seq)
+            self._mark_flushed(self._applied_seq)
+        self._map_epoch += 1
         shutil.rmtree(trash)
 
     # -- review queue ----------------------------------------------------------
@@ -771,13 +817,14 @@ class MemoryStore:
         """Ambiguous verdicts awaiting the owner's call, oldest first.
         Items whose memories have since vanished (forgotten, superseded)
         are silently dropped — the question answered itself."""
+        rows = self.journal.review_rows()
         resolved = {
             e.payload["review_seq"]
-            for e in self.journal.entries()
+            for e in rows
             if e.op == "review_resolved" and e.payload
         }
         items: list[ReviewItem] = []
-        for e in self.journal.entries():
+        for e in rows:
             if e.op != "review" or e.seq in resolved or e.payload is None:
                 continue
             new = self.get(e.memory_id)
@@ -826,7 +873,7 @@ class MemoryStore:
                 {"review_seq": seq, "accepted": accept},
             )
             self._applied_seq = max(self._applied_seq, resolved_seq)
-            self.journal.mark_flushed(resolved_seq)
+            self._mark_flushed(resolved_seq)
             return item
 
     def apply_synced(self, memory: Memory, shard: str, remote_ts: float) -> bool:
@@ -841,11 +888,13 @@ class MemoryStore:
             backend = self._backend(shard)
             seq = self.journal.append("sync-pull", memory.id, memory.to_payload(),
                                       shard=shard, ts=remote_ts)
-            emb = self.embedder.embed_documents([memory.text])[0]
-            backend.upsert(memory, emb)
-            self._applied_seq = max(self._applied_seq, seq)
-            backend.flush()
-            self.journal.mark_flushed(self._applied_seq)
+            with self._apply_guard():
+                emb = self.embedder.embed_documents([memory.text])[0]
+                backend.upsert(memory, emb)
+                self._applied_seq = max(self._applied_seq, seq)
+                backend.flush()
+            self._mark_flushed(self._applied_seq)
+            self._map_epoch += 1
             return True
 
     # -- backup / housekeeping ---------------------------------------------------
@@ -858,7 +907,7 @@ class MemoryStore:
         with self._write_lock, self._shard_guard.exclusive():
             for backend in self.backends.values():
                 backend.flush()
-            self.journal.mark_flushed(self._applied_seq)
+            self._mark_flushed(self._applied_seq)
             # Fold the SQLite WAL into journal.db, or the tar captures a
             # stale source of truth.
             self.journal.checkpoint()
@@ -903,7 +952,9 @@ class MemoryStore:
         self._applied_seq = self.journal.last_seq
         for backend in self.backends.values():
             backend.flush()
-        self.journal.mark_flushed(self._applied_seq)
+        self._flush_damaged = False  # a full replay refilled any gap
+        self._mark_flushed(self._applied_seq)
+        self._map_epoch += 1
         return applied
 
     def log_event(self, kind: str, hits: int = 0) -> None:
@@ -948,7 +999,7 @@ class MemoryStore:
             with self._write_lock, self._shard_guard.exclusive():
                 for backend in self.backends.values():
                     backend.flush()
-                self.journal.mark_flushed(self._applied_seq)
+                self._mark_flushed(self._applied_seq)
                 for backend in self.backends.values():
                     backend.close()
                 self.journal.close()
@@ -981,7 +1032,9 @@ class MemoryStore:
         self._applied_seq = self.journal.last_seq
         for backend in self.backends.values():
             backend.flush()
-        self.journal.mark_flushed(self._applied_seq)
+        self._flush_damaged = False  # replaying pending refilled any gap
+        self._mark_flushed(self._applied_seq)
+        self._map_epoch += 1
 
     def _apply_entry(self, entry: JournalEntry) -> None:
         backend = self._backend(entry.shard)

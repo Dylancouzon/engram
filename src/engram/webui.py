@@ -55,8 +55,15 @@ function initMap(cfg) {
   let hover = null, selected = null, filter = "", highlit = null;
 
   const esc = s => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
-  const cats = () => [...new Set(nodes.map(n => n.m[colorMode]))].sort();
-  const colorOf = n => PALETTE[Math.max(0, cats().indexOf(n.m[colorMode])) % PALETTE.length];
+  // Category->color computed once per colorMode change, not per node per frame:
+  // draw() runs on every hover/pan/zoom, so an O(n) rebuild inside colorOf made
+  // each frame O(n^2).
+  let cats = [], catColor = new Map();
+  function recolor() {
+    cats = [...new Set(nodes.map(n => n.m[colorMode]))].sort();
+    catColor = new Map(cats.map((c, i) => [c, PALETTE[i % PALETTE.length]]));
+  }
+  const colorOf = n => catColor.get(n.m[colorMode]) || PALETTE[0];
   const times = nodes.map(n => n.m.created_at);
   const lo = Math.min(...times), hi = Math.max(...times);
   const ageAlpha = n => 0.5 + 0.5 * ((n.m.created_at - lo) / ((hi - lo) || 1));
@@ -109,7 +116,7 @@ function initMap(cfg) {
     ctx.font = "600 11px -apple-system, system-ui, sans-serif"; ctx.textAlign = "center";
     for (const k in cent) {
       const c = cent[k];
-      ctx.fillStyle = PALETTE[Math.max(0, cats().indexOf(k)) % PALETTE.length];
+      ctx.fillStyle = catColor.get(k) || PALETTE[0];
       ctx.globalAlpha = 0.9; ctx.fillText(k, c.x / c.c, c.y / c.c - 15);
     }
     ctx.globalAlpha = 1;
@@ -183,14 +190,15 @@ function initMap(cfg) {
     b.onclick = () => {
       colorMode = b.dataset.mode;
       cfg.colorButtons.forEach(x => x.classList.toggle("on", x.dataset.mode === colorMode));
-      buildLegend(); draw();
+      recolor(); buildLegend(); draw();
     };
   });
   function buildLegend() {
     if (!cfg.legend) return;
-    cfg.legend.innerHTML = cats().map((c, i) =>
-      `<span><i style="background:${PALETTE[i % PALETTE.length]}"></i>${esc(c)}</span>`).join("");
+    cfg.legend.innerHTML = cats.map(c =>
+      `<span><i style="background:${catColor.get(c)}"></i>${esc(c)}</span>`).join("");
   }
+  recolor();
   buildLegend();
   resize();
 

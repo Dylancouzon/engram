@@ -103,3 +103,32 @@ def test_invalid_type_defaults_semantic():
 def test_no_llm_verbatim():
     [fact] = extract("remember me", None)
     assert fact.verbatim and fact.text == "remember me"
+
+
+def test_malformed_nonempty_memories_degrades_to_verbatim():
+    # A non-empty memories list whose entries don't parse (bare strings, a
+    # classic loose shape) must not be conflated with "nothing salient" — the
+    # input was never really judged, so keep it verbatim rather than drop it.
+    llm = EnvelopeLLM({"memories": ["Dylan's cat is named Miso"]})
+    [fact] = extract("Dylan's cat is named Miso", llm)
+    assert fact.verbatim and fact.text == "Dylan's cat is named Miso"
+
+
+def test_empty_memories_list_is_honored():
+    # A genuinely empty list means the model judged and dropped the input.
+    assert extract("is it going to rain?", EnvelopeLLM({"memories": []})) == []
+
+
+def test_null_importance_and_tags_do_not_crash():
+    # The model may emit null fields; parsing must degrade, not raise.
+    llm = EnvelopeLLM({"memories": [
+        {"text": "Dylan likes tea", "importance": None, "tags": None}]})
+    [fact] = extract("Dylan likes tea", llm)
+    assert fact.importance == 0.5 and fact.tags == [] and not fact.verbatim
+
+
+def test_non_numeric_importance_defaults():
+    llm = EnvelopeLLM({"memories": [
+        {"text": "Dylan likes tea", "importance": "high"}]})
+    [fact] = extract("Dylan likes tea", llm)
+    assert fact.importance == 0.5

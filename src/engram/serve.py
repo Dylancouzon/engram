@@ -52,6 +52,9 @@ def serve(config: Config, port: int = 0, open_browser: bool = True) -> None:
 
     Handler.config = config
     Handler.token = token
+    # One shared LLM so the availability probe (PROBE_TTL) caches across chat
+    # requests instead of re-probing Ollama on every message.
+    Handler.llm = LocalLLM(config.ollama_url, config.extraction_model)
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     httpd.daemon_threads = True  # a hung chat thread must not block shutdown
     bound_port = httpd.server_address[1]
@@ -73,6 +76,7 @@ class _BaseHandler(BaseHTTPRequestHandler):
     config: Config
     token: str
     port: int
+    llm: LocalLLM
 
     # -- security helpers -----------------------------------------------------
 
@@ -277,13 +281,12 @@ class _BaseHandler(BaseHTTPRequestHandler):
         if not self._line({"used": used}):
             return
 
-        llm = LocalLLM(self.config.ollama_url, self.config.extraction_model)
-        if not llm.available():
+        if not self.llm.available():
             self._line({"token": "(local model offline — run `ollama serve` and "
                                  "pull the model to chat about your memories)"})
             self._line({"done": True})
             return
-        for chunk in llm.chat(messages):
+        for chunk in self.llm.chat(messages):
             if not self._line({"token": chunk}):
                 return  # client disconnected; llm.chat closes its upstream
         self._line({"done": True})

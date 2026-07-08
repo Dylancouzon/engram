@@ -73,23 +73,34 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
     else:
         return [ExtractedFact(text=text.strip(), verbatim=True)]
 
+    raw = items if isinstance(items, list) else []
     facts: list[ExtractedFact] = []
-    for item in items if isinstance(items, list) else []:
+    for item in raw:
         if not isinstance(item, dict) or not item.get("text"):
             continue
         try:
             mtype = MemoryType(item.get("type", "semantic"))
         except ValueError:
             mtype = MemoryType.SEMANTIC
-        importance = max(0.0, min(1.0, float(item.get("importance", 0.5))))
+        # The model may hand back null/non-numeric fields; parse defensively
+        # (like resolve.py) so a loose envelope degrades to verbatim, never
+        # crashes the write — extraction is an enhancer, not a dependency.
+        try:
+            importance = max(0.0, min(1.0, float(item.get("importance") or 0.5)))
+        except (TypeError, ValueError):
+            importance = 0.5
         if importance < salience_floor:
             continue
-        tags = [str(t).lower() for t in item.get("tags", []) if t][:3]
+        tags = [str(t).lower() for t in (item.get("tags") or []) if t][:3]
         facts.append(ExtractedFact(text=str(item["text"]).strip(), type=mtype,
                                    importance=importance, tags=tags))
 
     if not facts:
-        return facts
+        # Distinguish "model deliberately returned nothing salient" (empty
+        # list -> honor it) from "model returned items but none parsed"
+        # (malformed envelope -> the input was never really judged, so keep
+        # it verbatim rather than silently dropping the user's text).
+        return [] if not raw else [ExtractedFact(text=text.strip(), verbatim=True)]
     # Fabrication guard: a weak local model handed contentless or degenerate
     # input can ignore it and emit an unrelated invented memory. If the
     # extraction as a WHOLE shares no content token with the input, it isn't

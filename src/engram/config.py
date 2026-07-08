@@ -98,7 +98,9 @@ class Config:
     def socket_path(self) -> Path:
         if env := os.environ.get("ENGRAM_SOCKET"):
             return Path(env)
-        return self.socket_override or self.data_dir / "daemon.sock"
+        # socket_override may arrive as a str from config.toml; wrap it so
+        # every consumer can treat socket_path as a Path.
+        return Path(self.socket_override) if self.socket_override else self.data_dir / "daemon.sock"
 
     @property
     def clients_path(self) -> Path:

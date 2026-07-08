@@ -223,6 +223,14 @@ class Journal:
         with self._lock:
             with self._conn:
                 self._conn.execute("DELETE FROM journal WHERE memory_id = ?", (memory_id,))
+                # A review row is keyed by the NEW memory's id but its payload
+                # carries the target's id and merged_text (the target's content
+                # folded in). Forgetting the target must purge those rows too,
+                # or its bytes survive in the log and every JSONL export.
+                self._conn.execute(
+                    "DELETE FROM journal WHERE json_extract(payload, '$.target_id') = ?",
+                    (memory_id,),
+                )
                 self._conn.execute(
                     "INSERT OR REPLACE INTO tombstones (memory_id, ts, shard)"
                     " VALUES (?, ?, ?)",
@@ -335,6 +343,15 @@ class Journal:
         with self._lock:
             return list(self._iter_rows("", ()))
 
+    def review_rows(self) -> list[JournalEntry]:
+        """Just the review / review_resolved rows, in seq order. Scanning the
+        whole log (entries()) to find these means json-parsing every upsert
+        payload — wasteful on a store with a year of writes; the review queue
+        reads this on every dashboard/serve refresh."""
+        with self._lock:
+            return list(self._iter_rows(
+                "WHERE op IN ('review', 'review_resolved')", ()))
+
     def export_jsonl(self, fp: TextIO) -> int:
         """Dump the whole journal as JSONL. Returns row count."""
         n = 0
@@ -365,7 +382,8 @@ class Journal:
                 else:
                     payload = row.get("payload")
                     if payload is not None and scrub is not None:
-                        for key in ("text", "source_text", "dropped_text", "source_ref"):
+                        for key in ("text", "source_text", "dropped_text",
+                                    "source_ref", "merged_text"):
                             if isinstance(payload.get(key), str):
                                 payload[key] = scrub(payload[key])
                     self._conn.execute(

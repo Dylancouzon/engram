@@ -155,7 +155,10 @@ def consolidate(
                                          superseded_by=semantic.id)
                     report["summarized"] += 1
 
-    store.journal.mark_flushed(store._applied_seq)
+    # Under the lock: a concurrent writer must not be mid-apply when we snapshot
+    # _applied_seq, or we could mark its not-yet-flushed row as flushed.
+    with store._write_lock:
+        store._mark_flushed(store._applied_seq)
     if not cancelled():
         # Only a COMPLETED run advances the daily checkpoint; a cancelled
         # run should resume at the next idle window instead.
@@ -174,6 +177,7 @@ def _soft_invalidate(store: MemoryStore, backend, shard: str, m: Memory,
     if superseded_by:
         m.superseded_by = superseded_by
     seq = store.journal.append("upsert", m.id, m.to_payload(), shard=shard)
-    backend.set_payload(m.id, {"valid_to": m.valid_to, "superseded_by": m.superseded_by})
-    store._applied_seq = max(store._applied_seq, seq)
-    backend.flush()
+    with store._apply_guard():
+        backend.set_payload(m.id, {"valid_to": m.valid_to, "superseded_by": m.superseded_by})
+        store._applied_seq = max(store._applied_seq, seq)
+        backend.flush()
