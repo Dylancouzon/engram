@@ -11,6 +11,7 @@ miniCOIL has its own query path (query_embed weights terms for matching).
 from __future__ import annotations
 
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,9 +30,16 @@ class Embedder:
         self._cache_dir = str(cache_dir)
         self._dense = None
         self._sparse = None
+        self._load_lock = threading.Lock()
 
     def _models(self):
-        if self._dense is None:
+        if self._dense is not None:
+            return self._dense, self._sparse
+        # Lock the ~600MB load: the daemon serves recalls on many threads and
+        # two concurrent first-touches would otherwise both load every model.
+        with self._load_lock:
+            if self._dense is not None:
+                return self._dense, self._sparse
             cache = Path(self._cache_dir)
             if not cache.exists() or not any(cache.iterdir()):
                 # The very first command a new user runs lands here and would

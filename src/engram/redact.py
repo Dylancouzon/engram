@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 
 PLACEHOLDER = "[REDACTED:{kind}]"
@@ -56,20 +57,22 @@ _ENTROPY_THRESHOLD = 4.2  # bits/char; base64-ish secrets sit ~5.2, English ~3.0
 
 
 def _shannon_entropy(s: str) -> float:
-    counts: dict[str, int] = {}
-    for ch in s:
-        counts[ch] = counts.get(ch, 0) + 1
     n = len(s)
-    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+    return -sum((c / n) * math.log2(c / n) for c in Counter(s).values())
 
 
 def _looks_like_secret(token: str) -> bool:
     if _HEX_ONLY.match(token):
         return False
-    has_upper = any(c.isupper() for c in token)
-    has_lower = any(c.islower() for c in token)
-    has_digit = any(c.isdigit() for c in token)
-    if not (has_upper and has_lower and has_digit):
+    # ≥2 of {upper, lower, digit}: a single-case random token (e.g. a base36
+    # key) is still a plausible secret and must reach the entropy check —
+    # requiring all three let it skip scoring entirely.
+    classes = sum((
+        any(c.isupper() for c in token),
+        any(c.islower() for c in token),
+        any(c.isdigit() for c in token),
+    ))
+    if classes < 2:
         return False
     return _shannon_entropy(token) >= _ENTROPY_THRESHOLD
 

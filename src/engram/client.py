@@ -222,8 +222,10 @@ class Client:
     def consolidate(self) -> dict:
         return dict(self.call("consolidate"))
 
-    def snapshot(self, path: str, passphrase: str | None) -> int:
-        return int(self.call("snapshot", path=path, passphrase=passphrase)["bytes"])
+    def snapshot(self, path: Path | str, passphrase: str | None) -> int:
+        # Resolve to an absolute path: the daemon may run from a different cwd.
+        return int(self.call("snapshot", path=str(Path(path).resolve()),
+                             passphrase=passphrase)["bytes"])
 
     def export_jsonl(self) -> str:
         return self.call("export")["jsonl"]

@@ -11,17 +11,21 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from engram.llm import LocalLLM
+from engram.llm import LocalLLM, clamp01
 from engram.models import MemoryType
 
 # Unicode word runs of 3+ chars, so grounding works for non-Latin scripts too
 # (Cyrillic, Greek, ...). Coarse for scripts without word spacing (CJK), but
 # the failure mode there is a safe fall back to verbatim, never a wrong store.
 _WORD = re.compile(r"\w{3,}")
+_REDACTION = re.compile(r"\[REDACTED:[^\]]*\]")
 
 
 def _content_tokens(text: str) -> set[str]:
-    return set(_WORD.findall(text.lower()))
+    # Drop redaction placeholders first: their generic words ("redacted",
+    # "secret", "token") must never be what grounds a fact against the input,
+    # or a fabricated memory passes the guard on any input that had a secret.
+    return set(_WORD.findall(_REDACTION.sub(" ", text).lower()))
 
 _SYSTEM = """You extract long-term memories from text for a personal memory system.
 
@@ -75,9 +79,11 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
 
     raw = items if isinstance(items, list) else []
     facts: list[ExtractedFact] = []
+    had_usable = False  # at least one item the model gave usable text for
     for item in raw:
         if not isinstance(item, dict) or not item.get("text"):
             continue
+        had_usable = True
         try:
             mtype = MemoryType(item.get("type", "semantic"))
         except ValueError:
@@ -85,10 +91,7 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
         # The model may hand back null/non-numeric fields; parse defensively
         # (like resolve.py) so a loose envelope degrades to verbatim, never
         # crashes the write — extraction is an enhancer, not a dependency.
-        try:
-            importance = max(0.0, min(1.0, float(item.get("importance") or 0.5)))
-        except (TypeError, ValueError):
-            importance = 0.5
+        importance = clamp01(item.get("importance") or 0.5, 0.5)
         if importance < salience_floor:
             continue
         tags = [str(t).lower() for t in (item.get("tags") or []) if t][:3]
@@ -96,11 +99,12 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
                                    importance=importance, tags=tags))
 
     if not facts:
-        # Distinguish "model deliberately returned nothing salient" (empty
-        # list -> honor it) from "model returned items but none parsed"
-        # (malformed envelope -> the input was never really judged, so keep
-        # it verbatim rather than silently dropping the user's text).
-        return [] if not raw else [ExtractedFact(text=text.strip(), verbatim=True)]
+        # Honor a real "nothing salient" judgment (the model gave usable items
+        # and they all fell below the floor, or it returned an empty list) as
+        # []. Only fall back to verbatim when NO usable item came back — a
+        # malformed envelope means the input was never really judged, so keep
+        # the user's text rather than silently dropping it.
+        return [] if (had_usable or not raw) else [ExtractedFact(text=text.strip(), verbatim=True)]
     # Fabrication guard: a weak local model handed contentless or degenerate
     # input can ignore it and emit an unrelated invented memory. If the
     # extraction as a WHOLE shares no content token with the input, it isn't

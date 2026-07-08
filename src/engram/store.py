@@ -262,12 +262,17 @@ class MemoryStore:
                             path, dense_dim=self.config.dense_dim,
                         )
 
+    def _shard_order(self) -> list[str]:
+        """Open shards with private first — the tie-break winner when the same
+        id turns up in more than one shard (recall dedup, id lookup)."""
+        return sorted(self.backends, key=lambda n: n != "private")
+
     def _locate(self, memory_id: str) -> tuple[str, Hit] | None:
         """The shard holding this id and its current point, in one retrieve
         (private wins if somehow duplicated). Callers that only need the
         shard use shard_of; reinforce needs the point too, and fetching it
         twice was pure waste on the post-recall path."""
-        for shard in sorted(self.backends, key=lambda n: n != "private"):
+        for shard in self._shard_order():
             with self._shard_guard.shared():
                 found = self.backends[shard].retrieve([memory_id])
             if found:
@@ -515,6 +520,25 @@ class MemoryStore:
         return WriteAction(op=Op.ADD, memory=new, confidence=verdict.confidence,
                            queued_review=queue)
 
+    def _commit_payload(self, m: Memory, shard: str,
+                        partial: dict | None = None, flush: bool = True) -> None:
+        """Journal a full-payload upsert but apply it to Edge as a payload-only
+        set — no re-embed, because the text is unchanged. `partial` defaults to
+        the whole payload; pass a subset (e.g. {"valid_to": ...}) to touch only
+        some fields. The (id, vector) set is untouched, so the map cache is not
+        invalidated. Shared by metadata edits, soft-forget, and consolidation's
+        invalidate/dedup."""
+        payload = m.to_payload()
+        seq = self.journal.append("upsert", m.id, payload, shard=shard)
+        backend = self._backend(shard)
+        with self._apply_guard():
+            backend.set_payload(m.id, partial if partial is not None else payload)
+            self._applied_seq = max(self._applied_seq, seq)
+            if flush:
+                backend.flush()
+        if flush:
+            self._mark_flushed(self._applied_seq)
+
     def _commit_upserts(self, memories: list[Memory], shard: str = "private") -> None:
         backend = self._backend(shard)
         intents = []
@@ -561,18 +585,18 @@ class MemoryStore:
         # Every shard uses the same embedding model, so raw scores ARE
         # comparable across shards; normalizing per shard would let a weak
         # shard's best hit outrank a strong shard's real match.
-        shards = [shard] if shard else sorted(
-            self.backends, key=lambda n: n != "private"
-        )
+        shards = [shard] if shard else self._shard_order()
         hits = []
+        seen_ids: set[str] = set()
         with self._shard_guard.shared():
             for name in shards:
                 shard_hits = self._backend(name).query_hybrid(
                     emb, k=k * 3, flt=flt, prefetch_limit=self.config.prefetch_limit,
                     mmr_lambda=self.config.mmr_lambda,
                 )
-                seen_ids = {h.id for h in hits}
-                hits.extend(h for h in shard_hits if h.id not in seen_ids)
+                fresh = [h for h in shard_hits if h.id not in seen_ids]
+                hits.extend(fresh)
+                seen_ids.update(h.id for h in fresh)
 
         now = now_ts()
         rescored: list[RecallHit] = []
@@ -594,12 +618,8 @@ class MemoryStore:
 
     def get(self, memory_id: str) -> Memory | None:
         """Fetch one memory by id from whichever shard holds it."""
-        with self._shard_guard.shared():
-            for name in sorted(self.backends, key=lambda n: n != "private"):
-                found = self.backends[name].retrieve([memory_id])
-                if found:
-                    return found[0].memory()
-        return None
+        located = self._locate(memory_id)
+        return located[1].memory() if located else None
 
     def find_by_prefix(self, prefix: str) -> Memory | None:
         """Resolve a short id prefix (what the CLI prints) to its memory.
@@ -608,7 +628,7 @@ class MemoryStore:
         prefix = prefix.lower()
         matches: dict[str, Memory] = {}
         with self._shard_guard.shared():
-            for name in sorted(self.backends, key=lambda n: n != "private"):
+            for name in self._shard_order():
                 for hit in self.backends[name].scroll_all():
                     if hit.id.startswith(prefix) and hit.id not in matches:
                         matches[hit.id] = hit.memory()
@@ -625,7 +645,7 @@ class MemoryStore:
             type=type.value if type else None,
             valid_at=None if include_invalid else now_ts(),
         )
-        shards = [shard] if shard else sorted(self.backends, key=lambda n: n != "private")
+        shards = [shard] if shard else self._shard_order()
         memories: dict[str, Memory] = {}
         with self._shard_guard.shared():
             for name in shards:
@@ -655,7 +675,7 @@ class MemoryStore:
         ids: list[str] = []
         vecs: list[list[float]] = []
         with self._shard_guard.shared():
-            for name in sorted(self.backends, key=lambda n: n != "private"):
+            for name in self._shard_order():
                 for pid, vector, _payload in self.backends[name].export_raw():
                     dense = vector.get("dense") if isinstance(vector, dict) else vector
                     if dense is not None:
@@ -717,13 +737,7 @@ class MemoryStore:
                 m.tags = list(dict.fromkeys(t.lower() for t in tags))
             if importance is not None:
                 m.importance = max(0.0, min(1.0, float(importance)))
-            payload = m.to_payload()
-            seq = self.journal.append("upsert", m.id, payload, shard=shard)
-            with self._apply_guard():
-                self._backend(shard).set_payload(m.id, payload)
-                self._applied_seq = max(self._applied_seq, seq)
-                self._backend(shard).flush()
-            self._mark_flushed(self._applied_seq)
+            self._commit_payload(m, shard)
             return m
 
     def _reinforce(self, memory_ids: list[str]) -> None:
@@ -785,13 +799,7 @@ class MemoryStore:
             if memory is None:
                 return None
             memory.valid_to = now_ts()
-            payload = memory.to_payload()
-            seq = self.journal.append("upsert", memory.id, payload, shard=owner_shard)
-            with self._apply_guard():
-                backend.set_payload(memory.id, {"valid_to": memory.valid_to})
-                self._applied_seq = max(self._applied_seq, seq)
-                backend.flush()
-            self._mark_flushed(self._applied_seq)
+            self._commit_payload(memory, owner_shard, {"valid_to": memory.valid_to})
             return memory
 
         # hard. Deleting the point from Edge is not enough: delete+flush
@@ -848,7 +856,10 @@ class MemoryStore:
                 continue
             new = self.get(e.memory_id)
             target = self.get(e.payload["target_id"])
-            if new is None or target is None or not target.is_valid:
+            # Both sides must still be live: if the owner soft-forgot the ADDed
+            # twin before reviewing, accepting would fold already-deleted
+            # content back into the target.
+            if new is None or target is None or not target.is_valid or not new.is_valid:
                 continue
             items.append(ReviewItem(
                 seq=e.seq,
@@ -923,10 +934,11 @@ class MemoryStore:
 
     # -- backup / housekeeping ---------------------------------------------------
 
-    def snapshot(self, dest: Path, passphrase: str | None) -> int:
+    def snapshot(self, dest: Path | str, passphrase: str | None) -> int:
         """Quiesced, encrypted-by-default backup of the memory folder."""
         from engram.archive import write_snapshot
 
+        dest = Path(dest)
         self.flush_reinforce()
         with self._write_lock, self._shard_guard.exclusive():
             for backend in self.backends.values():
@@ -941,6 +953,13 @@ class MemoryStore:
         from engram.consolidate import consolidate
 
         return consolidate(self, stop=stop)
+
+    def sync(self, shard: str) -> dict:
+        """Push/pull one shard through its configured relay (LWW merge).
+        Mirrors the daemon Client.sync so both surfaces call store.sync(name)."""
+        from engram.sync import sync_shard
+
+        return sync_shard(self, shard)
 
     # -- maintenance ---------------------------------------------------------------
 
@@ -966,20 +985,7 @@ class MemoryStore:
                 shutil.rmtree(self.config.shards_root)
                 self.backends = {}
                 self._backend("private")
-        applied = 0
-        tombstoned = self.journal.tombstones()
-        for entry in self.journal.entries():
-            if entry.memory_id in tombstoned:
-                continue
-            self._apply_entry(entry)
-            applied += 1
-        self._applied_seq = self.journal.last_seq
-        for backend in self.backends.values():
-            backend.flush()
-        self._flush_damaged = False  # a full replay refilled any gap
-        self._mark_flushed(self._applied_seq)
-        self._map_epoch += 1
-        return applied
+        return self._replay(self.journal.entries())
 
     def log_event(self, kind: str, hits: int = 0) -> None:
         """Record a proactive-trigger firing (hook recall/capture)."""
@@ -1046,29 +1052,38 @@ class MemoryStore:
 
     def _replay_pending(self) -> None:
         pending = self.journal.pending()
-        if not pending:
-            return
+        if pending:
+            self._replay(pending)
+
+    def _replay(self, entries: list[JournalEntry]) -> int:
+        """Apply journal entries to Edge in seq order (last write wins),
+        skipping tombstoned ids, then flush and advance the high-water mark.
+        Shared by full rebuild and crash-replay. Re-embeds every
+        upsert/sync-pull row in ONE batch — a crash with many unflushed
+        writes would otherwise make replay-on-open do N separate model calls.
+        Returns the number of entries applied."""
         tombstoned = self.journal.tombstones()
-        for entry in pending:
-            if entry.memory_id in tombstoned:
-                continue
-            self._apply_entry(entry)
+        live = [e for e in entries if e.memory_id not in tombstoned]
+        upserts = [e for e in live
+                   if e.op in ("upsert", "sync-pull") and e.payload is not None]
+        emb_iter = iter(
+            self.embedder.embed_documents([e.payload["text"] for e in upserts])
+            if upserts else []
+        )
+        for entry in live:
+            backend = self._backend(entry.shard)
+            if entry.op in ("upsert", "sync-pull") and entry.payload is not None:
+                memory = Memory.from_payload(entry.memory_id, entry.payload)
+                backend.upsert(memory, next(emb_iter))
+            elif entry.op == "reinforce" and entry.payload is not None:
+                # Only meaningful if the point exists (skip bumps for
+                # later-forgotten ids).
+                if backend.retrieve([entry.memory_id]):
+                    backend.set_payload(entry.memory_id, entry.payload)
         self._applied_seq = self.journal.last_seq
         for backend in self.backends.values():
             backend.flush()
-        self._flush_damaged = False  # replaying pending refilled any gap
+        self._flush_damaged = False  # a full replay refilled any gap
         self._mark_flushed(self._applied_seq)
         self._map_epoch += 1
-
-    def _apply_entry(self, entry: JournalEntry) -> None:
-        backend = self._backend(entry.shard)
-        if entry.op in ("upsert", "sync-pull") and entry.payload is not None:
-            memory = Memory.from_payload(entry.memory_id, entry.payload)
-            emb = self.embedder.embed_documents([memory.text])[0]
-            backend.upsert(memory, emb)
-        elif entry.op == "delete":
-            backend.delete([entry.memory_id])
-        elif entry.op == "reinforce" and entry.payload is not None:
-            # Only meaningful if the point exists (skip bumps for later-forgotten ids).
-            if backend.retrieve([entry.memory_id]):
-                backend.set_payload(entry.memory_id, entry.payload)
+        return len(live)

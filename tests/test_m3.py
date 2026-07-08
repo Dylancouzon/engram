@@ -1,6 +1,7 @@
 """M3: two-device encrypted sync (LWW merge, tombstone suppression,
 private-never-syncs) and capability tokens."""
 
+import base64
 import shutil
 
 import pytest
@@ -90,8 +91,12 @@ def test_relay_holds_only_ciphertext(tmp_path, cloud):
         records, _ = cloud.scroll("engram-me-synced", limit=10, with_payload=True)
         assert records
         for r in records:
-            blob = str(r.payload)
-            assert "Miso" not in blob and "cat" not in blob
+            # The relay sees only opaque fields; the memory travels as a Fernet
+            # blob. Check the DECODED ciphertext bytes, not the base64 form — a
+            # substring scan of base64 hits short letter runs ("cat") by chance.
+            assert set(r.payload) <= {"op", "blob", "ts", "device"}
+            raw = base64.urlsafe_b64decode(r.payload["blob"])
+            assert b"Miso" not in raw and b"cat" not in raw
     finally:
         a.close()
 

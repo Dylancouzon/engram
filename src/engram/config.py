@@ -126,6 +126,21 @@ class Config:
             overrides = tomllib.loads(toml_path.read_text())
             valid = {f.name for f in fields(cls)}
             for key, value in overrides.items():
-                if key in valid and key != "data_dir":
-                    setattr(cfg, key, value)
+                if key not in valid or key == "data_dir":
+                    continue
+                current = getattr(cfg, key)
+                # config.toml is hand-edited: coerce a mistyped number
+                # (salience_floor = "0.8") to the field's type instead of
+                # silently storing a string that blows up on the first write.
+                # bool is an int subclass, so guard it first and leave it be.
+                if not isinstance(current, bool) and isinstance(current, (int, float)) \
+                        and not isinstance(value, type(current)):
+                    try:
+                        value = type(current)(value)
+                    except (TypeError, ValueError) as e:
+                        raise ValueError(
+                            f"config.toml: {key}={value!r} is not a "
+                            f"{type(current).__name__}"
+                        ) from e
+                setattr(cfg, key, value)
         return cfg

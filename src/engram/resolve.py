@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from engram.llm import LocalLLM
+from engram.llm import LocalLLM, clamp01
 from engram.models import Memory, Op
 
 _SYSTEM = """You maintain a personal long-term memory store. Given a NEW fact and a list of
@@ -99,10 +99,7 @@ def judge(new_fact: str, candidates: list[Memory], llm: LocalLLM | None) -> Verd
         # An op that needs a target but names none is not actionable.
         return Verdict(op=Op.ADD, target=None, confidence=0.0)
 
-    try:
-        confidence = max(0.0, min(1.0, float(result.get("confidence", 0.0))))
-    except (TypeError, ValueError):
-        confidence = 0.0
+    confidence = clamp01(result.get("confidence", 0.0), 0.0)
 
     merged = result.get("text")
     if op is Op.UPDATE and not (isinstance(merged, str) and merged.strip()):

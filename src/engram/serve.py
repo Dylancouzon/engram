@@ -195,6 +195,10 @@ class _BaseHandler(BaseHTTPRequestHandler):
             return self._json({"error": f"daemon unavailable: {e}"}, 503)
         except ProtocolError as e:
             return self._json({"error": e.code + ": " + str(e)}, 400)
+        except (KeyError, ValueError, TypeError) as e:
+            # A missing/malformed body field must return a JSON error, not
+            # crash the handler and drop the connection with no response.
+            return self._json({"error": f"bad request: {e}"}, 400)
         return self._deny(404, "not found")
 
     # -- API handlers ---------------------------------------------------------

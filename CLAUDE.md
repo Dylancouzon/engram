@@ -72,6 +72,35 @@ call, so daemon shutdown could block ~60s — consolidation is now two-phase
 strict re-validation that discards any summary whose source episodes were
 changed or forgotten mid-run, so forgotten content can't reappear).
 
+A refactor/logic-review pass (10 Sonnet subsystem reviewers, findings
+consolidated + ponytail-filtered to "clean code + bugs a solo dogfooder
+hits", multi-user/adversarial-relay/scale-over-years cases dropped) fixed 16
+things across 17 files (net −104 LOC), 7 new tests. **Bugs:** shard-exists now
+keys on `edge_config.json` not "any file" (a `.DS_Store` from opening
+`~/.engram` in Finder crashed the first write); `seed` routed through
+`_open_surface` (was library-only, hard-failed under the daemon); `serve`
+`do_POST` returns JSON 400 on a malformed body instead of dropping the
+connection; MCP `recall`/`forget` catch `DaemonUnavailable` (was a raw
+traceback after a retry); `engram consolidate` client socket timeout raised to
+600s (the "caller passes a larger value" comment described a caller that never
+existed); `pending_reviews` also checks the twin's validity (soft-forgetting
+the ADDed twin then accepting resurrected deleted content); extraction honors
+all-below-salience-floor as `[]` instead of overwriting verbatim, and strips
+`[REDACTED:…]` placeholders before the fabrication-grounding check; embedder
+lazy-load is locked (was double-loading ~600MB under daemon threads);
+`config.toml` numeric overrides coerce or fail loudly; the redaction entropy
+gate loosened to ≥2-of-3 char classes (a single-case token skipped scoring
+entirely). **Cleanups:** `_shard_order`/`_commit_payload`/`_replay` helpers in
+store (the last batch-embeds on replay instead of one call per row);
+`to_payload` → `asdict` minus id; `_parse_tags`/`_hook_payload` in the CLI;
+the `isinstance(Client)` branches for sync/snapshot collapsed via a thin
+`MemoryStore.sync` + `snapshot(Path|str)`; `_clamp01`/`_post` shared in the
+write model; the dead `delete` journal op removed across journal/store/sync; a
+`journal(op)` index so `review_rows()` (every dashboard/serve refresh) stops
+full-scanning. **Flagged, not fixed** (needs Dylan): `shared:<group>` pools
+reuse one sync key across all shards, so they aren't isolated between people —
+irrelevant solo, a real design decision before inviting anyone.
+
 Not built (deliberate cuts, not omissions): Wave-C/D ingestion adapters
 (email/messages/voice/CLIP) — the adapter *contract* is documented in
 `docs/ingestion.md` and the write path is proven, so these are per-source

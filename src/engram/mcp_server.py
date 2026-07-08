@@ -103,6 +103,8 @@ def run_mcp(config: Config, client_name: str, token: str | None = None) -> None:
         by recency and importance. Query with natural language."""
         try:
             hits = call(client.recall, query, k=k, scope=scope, retry=True)
+        except DaemonUnavailable:
+            return "The memory daemon is unavailable; recall could not run."
         except ProtocolError as e:
             return _protocol_help(e, client_name)
         if not hits:
@@ -124,6 +126,9 @@ def run_mcp(config: Config, client_name: str, token: str | None = None) -> None:
             # Idempotent by id (forgetting twice converges), so retry is safe.
             done = call(client.forget, memory_id, mode="hard" if hard else "soft",
                         retry=True)
+        except DaemonUnavailable:
+            return ("The memory daemon is unavailable; nothing was forgotten. "
+                    "Try again once it is running.")
         except ProtocolError as e:
             return _protocol_help(e, client_name)
         if not done:

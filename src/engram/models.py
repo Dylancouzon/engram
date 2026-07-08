@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
 
@@ -66,24 +66,12 @@ class Memory:
     embedding_model: str = ""  # dense model pin, set on embed
 
     def to_payload(self) -> dict[str, Any]:
-        return {
-            "text": self.text,
-            "type": self.type.value,
-            "scope": self.scope,
-            "tags": self.tags,
-            "surface": self.surface,
-            "source_text": self.source_text,
-            "source_ref": self.source_ref,
-            "created_at": self.created_at,
-            "event_time": self.event_time,
-            "valid_from": self.valid_from,
-            "valid_to": self.valid_to,
-            "superseded_by": self.superseded_by,
-            "importance": self.importance,
-            "access_count": self.access_count,
-            "last_accessed": self.last_accessed,
-            "embedding_model": self.embedding_model,
-        }
+        # asdict minus id keeps this in lockstep with the fields above (a new
+        # field can't be silently dropped from the durable payload/export).
+        d = asdict(self)
+        d.pop("id")
+        d["type"] = self.type.value  # StrEnum -> plain str for the payload contract
+        return d
 
     @classmethod
     def from_payload(cls, id: str, payload: dict[str, Any]) -> Memory:

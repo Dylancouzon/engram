@@ -82,6 +82,15 @@ def test_high_entropy_token_redacted():
     assert "high-entropy" in r.hits
 
 
+def test_single_case_high_entropy_token_redacted():
+    # lowercase+digits only, non-hex: a base36-style token still has ≥2
+    # character classes, so it must reach the entropy check (an all-three
+    # requirement let it skip scoring and land in cleartext).
+    token = _join("k3m9q7z2x8", "w4n6b1v5c0", "j7h3g8p2rt")
+    r = redact(f"value is {token} noted")
+    assert "high-entropy" in r.hits and token not in r.text
+
+
 def test_hex_sha_not_redacted():
     sha = "3b18e512dba79e4c8300dd08aeb37f8e728b8dad"
     r = redact(f"the fix landed in commit {sha}")

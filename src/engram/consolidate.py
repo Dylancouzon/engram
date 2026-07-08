@@ -74,6 +74,8 @@ def consolidate(
             protected.add(item.new.id)
             protected.add(item.target.id)
         for shard, backend in list(store.backends.items()):
+            if cancelled():
+                break
             valid = [
                 hit.memory()
                 for hit in backend.scroll_all(
@@ -97,7 +99,7 @@ def consolidate(
                     -math.log(2) * age_days / PRUNE_HALF_LIFE_DAYS
                 )
                 if score < PRUNE_SCORE:
-                    _soft_invalidate(store, backend, shard, m)
+                    _soft_invalidate(store, shard, m)
                     report["pruned"] += 1
 
             # -- dedup ------------------------------------------------------------
@@ -116,8 +118,12 @@ def consolidate(
                     continue
                 prior.importance = max(prior.importance, m.importance)
                 prior.access_count += m.access_count
-                store._commit_upserts([prior], shard)
-                _soft_invalidate(store, backend, shard, m, superseded_by=prior.id)
+                # Payload-only: prior's text is unchanged, so skip the re-embed.
+                store._commit_payload(prior, shard, {
+                    "importance": prior.importance,
+                    "access_count": prior.access_count,
+                })
+                _soft_invalidate(store, shard, m, superseded_by=prior.id)
                 report["deduped"] += 1
 
             # -- gather episodic->semantic groups (model calls come in phase 2) --
@@ -192,8 +198,7 @@ def consolidate(
                 )
                 store._commit_upserts([semantic], shard)
                 for e in live:
-                    _soft_invalidate(store, backend, shard, e,
-                                     superseded_by=semantic.id)
+                    _soft_invalidate(store, shard, e, superseded_by=semantic.id)
                 report["summarized"] += 1
             store._mark_flushed(store._applied_seq)
 
@@ -209,13 +214,10 @@ def last_run(store: MemoryStore) -> float:
     return float(value) if value else 0.0
 
 
-def _soft_invalidate(store: MemoryStore, backend, shard: str, m: Memory,
+def _soft_invalidate(store: MemoryStore, shard: str, m: Memory,
                      superseded_by: str | None = None) -> None:
     m.valid_to = now_ts()
     if superseded_by:
         m.superseded_by = superseded_by
-    seq = store.journal.append("upsert", m.id, m.to_payload(), shard=shard)
-    with store._apply_guard():
-        backend.set_payload(m.id, {"valid_to": m.valid_to, "superseded_by": m.superseded_by})
-        store._applied_seq = max(store._applied_seq, seq)
-        backend.flush()
+    store._commit_payload(
+        m, shard, {"valid_to": m.valid_to, "superseded_by": m.superseded_by})

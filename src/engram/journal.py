@@ -32,7 +32,7 @@ from typing import Any, TextIO
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS journal (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    op TEXT NOT NULL,               -- 'upsert' | 'delete' | 'reinforce' | audit rows
+    op TEXT NOT NULL,               -- 'upsert' | 'sync-pull' | 'reinforce' | audit rows
     memory_id TEXT NOT NULL,
     idempotency_key TEXT UNIQUE,
     payload TEXT,                   -- JSON Memory payload for upsert; counters for reinforce
@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS journal (
     shard TEXT NOT NULL DEFAULT 'private'
 );
 CREATE INDEX IF NOT EXISTS journal_memory_id ON journal (memory_id);
+-- review_rows() filters on op on every dashboard/serve refresh; without this
+-- index it full-scans the whole log, which grows with a year of writes.
+CREATE INDEX IF NOT EXISTS journal_op ON journal (op);
 CREATE TABLE IF NOT EXISTS tombstones (
     memory_id TEXT PRIMARY KEY,
     ts REAL NOT NULL,
@@ -284,7 +287,7 @@ class Journal:
         with self._lock:
             row = self._conn.execute(
                 "SELECT MAX(ts) FROM journal WHERE memory_id = ?"
-                " AND op IN ('upsert', 'delete', 'sync-pull')",
+                " AND op IN ('upsert', 'sync-pull')",
                 (memory_id,),
             ).fetchone()
         return row[0] or 0.0
@@ -391,6 +394,13 @@ class Journal:
                                     "source_ref", "merged_text"):
                             if isinstance(payload.get(key), str):
                                 payload[key] = scrub(payload[key])
+                    if row["op"] == "reinforce":
+                        # Import can run against a non-empty journal; collapse
+                        # to one reinforce row per id like reinforce() does, so
+                        # overlapping imports don't leak read-volume rows.
+                        self._conn.execute(
+                            "DELETE FROM journal WHERE memory_id = ? AND op = 'reinforce'",
+                            (row["memory_id"],))
                     self._conn.execute(
                         "INSERT INTO journal (op, memory_id, payload, ts, shard)"
                         " VALUES (?, ?, ?, ?, ?)",

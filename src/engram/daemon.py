@@ -13,6 +13,7 @@ which part of your memory. Capability tokens land with shared pools (M3).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -37,8 +38,10 @@ from engram.protocol import (
     action_to_wire,
     error_response,
     hit_to_wire,
+    memory_to_wire,
     ok_response,
     read_message,
+    review_to_wire,
     write_message,
 )
 from engram.store import MemoryStore, WriteRefusedError
@@ -125,8 +128,6 @@ class Daemon:
         self._last_request = 0.0
 
     def _track_request(self):
-        import contextlib
-
         @contextlib.contextmanager
         def tracked():
             with self._inflight_cond:
@@ -251,13 +252,12 @@ class Daemon:
         if memory is None:
             raise ProtocolError(E_NOT_FOUND, f"no memory {memory_id}")
         _check_scope(scopes, memory.scope)
-        forgotten = self.store.forget(memory_id, mode=params.get("mode", "soft"))
-        return {"forgotten": forgotten is not None, "mode": params.get("mode", "soft")}
+        mode = params.get("mode", "soft")
+        forgotten = self.store.forget(memory_id, mode=mode)
+        return {"forgotten": forgotten is not None, "mode": mode}
 
     def _m_get(self, params: dict, scopes: list[str], client: str) -> dict:
         import uuid as _uuid
-
-        from engram.protocol import memory_to_wire
 
         ref = str(params["id"])
         try:
@@ -273,8 +273,6 @@ class Daemon:
         return {"memory": memory_to_wire(memory)}
 
     def _m_list(self, params: dict, scopes: list[str], client: str) -> dict:
-        from engram.protocol import memory_to_wire
-
         scope = params.get("scope")
         if scope:
             _check_scope(scopes, scope)
@@ -299,8 +297,6 @@ class Daemon:
         return {"points": self.store.map_points(int(params.get("neighbors", 3)))}
 
     def _m_edit(self, params: dict, scopes: list[str], client: str) -> dict:
-        from engram.protocol import memory_to_wire
-
         current = self.store.get(str(params["id"]))
         if current is None:
             raise ProtocolError(E_NOT_FOUND, f"no memory {params['id']}")
@@ -320,8 +316,6 @@ class Daemon:
         return {"memory": memory_to_wire(updated)}
 
     def _m_reviews(self, params: dict, scopes: list[str], client: str) -> dict:
-        from engram.protocol import review_to_wire
-
         _check_scope(scopes, "*")  # owner decision, full access only
         return {"reviews": [review_to_wire(i) for i in self.store.pending_reviews()]}
 
@@ -388,7 +382,10 @@ class Daemon:
                     try:
                         message = read_message(self.rfile)
                     except ProtocolError as e:
-                        write_message(self.wfile, error_response(None, e.code, str(e)))
+                        # Same guard as the response write below: a client that
+                        # already hung up must not raise in the handler thread.
+                        with contextlib.suppress(ConnectionError, BrokenPipeError):
+                            write_message(self.wfile, error_response(None, e.code, str(e)))
                         return
                     except (ConnectionError, ValueError, TimeoutError, OSError):
                         return
@@ -434,8 +431,6 @@ class Daemon:
             threading.Thread(target=self._server.shutdown, daemon=True).start()
 
     def _flush_loop(self) -> None:
-        import contextlib
-
         from engram.consolidate import last_run
 
         while not self._stop.wait(REINFORCE_FLUSH_SECONDS):

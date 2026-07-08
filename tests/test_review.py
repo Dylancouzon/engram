@@ -44,6 +44,17 @@ def test_accept_supersede_applies_late(config):
         store.close()
 
 
+def test_review_disappears_when_twin_forgotten(config):
+    # Soft-forgetting the ADDed twin before reviewing must drop the review:
+    # accepting it would fold already-deleted content back into the target.
+    store, first, second = _ambiguous_supersede(config)
+    try:
+        store.forget(second.memory.id, mode="soft")
+        assert store.pending_reviews() == []
+    finally:
+        store.close()
+
+
 def test_reject_keeps_both(config):
     store, first, second = _ambiguous_supersede(config)
     try:

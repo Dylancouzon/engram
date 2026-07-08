@@ -33,20 +33,34 @@ def _config(data_dir: str | None) -> Config:
     return Config.load(Path(data_dir) if data_dir else None)
 
 
+def _parse_tags(tags: str | None) -> list[str] | None:
+    return [t.strip() for t in tags.split(",") if t.strip()] if tags else None
+
+
+def _hook_payload() -> dict:
+    """The hook JSON on stdin, or {} when absent/malformed. Callers guard on
+    the fields they need, so a bad payload degrades to a no-op."""
+    try:
+        return json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return {}
+
+
 def _open_store(data_dir: str | None) -> MemoryStore:
     try:
         return MemoryStore(_config(data_dir))
     except StoreLockedError as e:
         raise click.ClickException(
-            f"{e} — if that's the daemon, this command talks to it automatically;"
-            " otherwise remove the stale lock"
+            f"{e} — this command needs exclusive access; stop the daemon"
+            " (or remove a stale lock) and retry"
         ) from e
 
 
-def _open_surface(data_dir: str | None) -> Client | MemoryStore:
-    """Daemon when it's running, library mode when it's not."""
+def _open_surface(data_dir: str | None, timeout: float = 120.0) -> Client | MemoryStore:
+    """Daemon when it's running, library mode when it's not. `timeout` sets
+    the client socket read timeout — bump it for long calls (consolidate)."""
     cfg = _config(data_dir)
-    client = Client(cfg, client_name="cli")
+    client = Client(cfg, client_name="cli", timeout=timeout)
     try:
         client.connect(spawn=False)
         return client
@@ -109,7 +123,7 @@ def remember(data_dir: str | None, text: str, mtype: str | None, tags: str | Non
              shard: str) -> None:
     """Store something worth keeping. Conflicts with existing memories are
     resolved on write: corrections supersede, refinements update."""
-    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
+    tag_list = _parse_tags(tags)
     with _open_surface(data_dir) as store:
         try:
             actions = store.remember(
@@ -160,7 +174,7 @@ def recall(data_dir: str | None, query: str, k: int | None, scope: str | None,
            mtype: str | None, tags: str | None, shard: str | None, as_json: bool) -> None:
     """Surface the memories relevant to a query (hybrid search, decayed by
     recency, weighted by importance)."""
-    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
+    tag_list = _parse_tags(tags)
     with _open_surface(data_dir) as store:
         hits = store.recall(
             query, k=k, scope=scope,
@@ -390,7 +404,7 @@ def seed(data_dir: str | None, paths: tuple[Path, ...], scope: str, shard: str) 
             chunks.append((chunk, str(path)))
     click.echo(f"seeding {len(chunks)} chunks from {len(files)} file(s)...")
     counts: dict[Op, int] = {}
-    with _open_store(data_dir) as store, click.progressbar(chunks, label="remembering") as bar:
+    with _open_surface(data_dir) as store, click.progressbar(chunks, label="remembering") as bar:
         for text, ref in bar:
             try:
                 for action in store.remember(text, scope=scope, source_ref=ref,
@@ -427,7 +441,8 @@ def stats(data_dir: str | None) -> None:
         if isinstance(store, Client):
             info["daemon"] = "running"
     for key, value in info.items():
-        click.echo(f"{key:>16}: {value}")
+        rendered = json.dumps(value) if isinstance(value, (dict, list)) else value
+        click.echo(f"{key:>16}: {rendered}")
 
 
 @main.command()
@@ -591,11 +606,7 @@ def snapshot(data_dir: str | None, output: Path, passphrase: str | None,
         passphrase = click.prompt("snapshot passphrase", hide_input=True,
                                   confirmation_prompt=True)
     with _open_surface(data_dir) as store:
-        if isinstance(store, Client):
-            size = store.snapshot(str(output.resolve()),
-                                  None if no_encrypt else passphrase)
-        else:
-            size = store.snapshot(output, None if no_encrypt else passphrase)
+        size = store.snapshot(output, None if no_encrypt else passphrase)
     enc = "unencrypted" if no_encrypt else "encrypted"
     click.echo(f"wrote {enc} snapshot: {output} ({size / 1024:.0f} KiB)")
 
@@ -627,7 +638,9 @@ def restore(data_dir: str | None, source: Path, passphrase: str | None) -> None:
 def consolidate(data_dir: str | None) -> None:
     """Housekeeping now instead of waiting for the daemon's idle run:
     prune stale episodes, dedup, summarize old episodes into facts."""
-    with _open_surface(data_dir) as store:
+    # Summarization runs several LLM calls; give the daemon room before the
+    # client socket read times out (matches the daemon's own shutdown drain).
+    with _open_surface(data_dir, timeout=600.0) as store:
         report = store.consolidate()
     click.echo(", ".join(f"{k} {v}" for k, v in report.items()) or "nothing to do")
 
@@ -645,10 +658,7 @@ def hook_session_start(data_dir: str | None, scope: str | None, k: int) -> None:
     """Claude Code SessionStart hook: surface memories relevant to the
     project being opened. Reads the hook payload on stdin, prints a context
     block on stdout. Speculative recall: never reinforces."""
-    try:
-        payload = json.loads(sys.stdin.read() or "{}")
-    except ValueError:
-        payload = {}
+    payload = _hook_payload()
     cwd = Path(payload.get("cwd") or Path.cwd())
     query = f"project {cwd.name} preferences conventions decisions corrections"
     with _open_surface(data_dir) as store:
@@ -678,10 +688,7 @@ def hook_user_prompt(data_dir: str | None, scope: str | None, k: int,
     """Claude Code UserPromptSubmit hook: recall against the prompt itself,
     inject only confident hits. Deterministic recall-at-the-right-moment —
     the model never has to remember to ask."""
-    try:
-        payload = json.loads(sys.stdin.read() or "{}")
-    except ValueError:
-        payload = {}
+    payload = _hook_payload()
     prompt = (payload.get("prompt") or "").strip()
     if len(prompt) < 12:  # nothing to match against
         return
@@ -735,10 +742,7 @@ def hook_capture(data_dir: str | None, scope: str, max_chars: int) -> None:
     just ended. Runs the tail of the transcript through the full write
     pipeline; extraction's salience gate + dedup keep it clean. No-ops
     without a local extraction model (verbatim transcripts are not memories)."""
-    try:
-        payload = json.loads(sys.stdin.read() or "{}")
-    except ValueError:
-        return
+    payload = _hook_payload()
     transcript_path = payload.get("transcript_path")
     if not transcript_path or not Path(transcript_path).exists():
         return
@@ -927,7 +931,7 @@ def sync_setup(data_dir: str | None, shard: str, url: str,
 @click.pass_obj
 def sync_now(data_dir: str | None, shard: str | None) -> None:
     """Push local changes, pull the union, merge (LWW + tombstones)."""
-    from engram.sync import SyncError, load_targets, sync_shard
+    from engram.sync import SyncError, load_targets
 
     cfg = _config(data_dir)
     shards = [shard] if shard else list(load_targets(cfg))
@@ -936,8 +940,7 @@ def sync_now(data_dir: str | None, shard: str | None) -> None:
     with _open_surface(data_dir) as store:
         for name in shards:
             try:
-                report = (store.sync(name) if isinstance(store, Client)
-                          else sync_shard(store, name))
+                report = store.sync(name)
             except SyncError as e:
                 raise click.ClickException(str(e)) from e
             summary = ", ".join(f"{k} {v}" for k, v in report.items())

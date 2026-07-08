@@ -75,6 +75,17 @@ def test_contentless_input_cannot_smuggle_a_fabrication():
     assert fact.verbatim and fact.text == "ok"
 
 
+def test_redaction_placeholder_does_not_ground_a_fabrication():
+    # The input's only "content" is a redaction placeholder. A fabricated fact
+    # that merely echoes placeholder words ("secret", "token") must NOT pass
+    # the grounding check — placeholders are stripped before tokenizing, so
+    # they can't be what grounds a memory against the input.
+    llm = EnvelopeLLM({"memories": [
+        {"text": "Dylan's API secret token rotates weekly", "importance": 0.7}]})
+    [fact] = extract("[REDACTED:assigned-secret]", llm)
+    assert fact.verbatim
+
+
 def test_garbage_falls_back_to_verbatim():
     [fact] = extract("keep me", EnvelopeLLM("not json at all"))
     assert fact.verbatim and fact.text == "keep me"
@@ -92,6 +103,18 @@ def test_salience_floor_drops_trivia():
     ]})
     facts = extract("the important thing plus some filler", llm, salience_floor=0.1)
     assert [f.text for f in facts] == ["important thing"]
+
+
+def test_all_below_salience_floor_is_honored_not_verbatim():
+    # Well-formed items that ALL fall below the floor is a real "nothing
+    # salient" judgment — return [], don't overwrite it with the raw text
+    # verbatim (which would defeat the floor the model just applied).
+    llm = EnvelopeLLM({"memories": [
+        {"text": "minor detail", "importance": 0.05},
+        {"text": "another triviality", "importance": 0.02},
+    ]})
+    assert extract("a minor detail and another triviality", llm,
+                   salience_floor=0.1) == []
 
 
 def test_invalid_type_defaults_semantic():

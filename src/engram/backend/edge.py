@@ -93,7 +93,10 @@ def build_filter(
 
 class EdgeBackend:
     def __init__(self, shard_dir: Path, dense_dim: int):
-        if shard_dir.exists() and any(shard_dir.iterdir()):
+        # Detect an existing shard by its own marker file, not "any file" —
+        # a stray .DS_Store (Finder browsing ~/.engram) would otherwise make
+        # a fresh dir look loadable and crash EdgeShard.load on non-shard data.
+        if (shard_dir / "edge_config.json").exists():
             self._shard = EdgeShard.load(str(shard_dir))
         else:
             shard_dir.mkdir(parents=True, exist_ok=True)
@@ -140,25 +143,30 @@ class EdgeBackend:
             )
         )
 
+    def _scroll_pages(self, flt: Filter | None = None, with_vector: bool = False):
+        """Yield every stored record, paging through the shard."""
+        offset = None
+        while True:
+            records, offset = self._shard.scroll(
+                ScrollRequest(
+                    offset=offset, limit=256, filter=flt,
+                    with_payload=True, with_vector=with_vector,
+                )
+            )
+            yield from records
+            if offset is None or not records:
+                break
+
     def export_raw(self, exclude: set[str] | None = None) -> list[tuple[str, Any, dict]]:
         """Every point with its stored vectors and payload, minus `exclude`.
         Feeds the purge-rebuild: points move to a fresh shard verbatim,
         no re-embedding."""
         exclude = exclude or set()
-        out: list[tuple[str, Any, dict]] = []
-        offset = None
-        while True:
-            records, offset = self._shard.scroll(
-                ScrollRequest(offset=offset, limit=256, with_payload=True, with_vector=True)
-            )
-            out.extend(
-                (str(r.id), r.vector, r.payload or {})
-                for r in records
-                if str(r.id) not in exclude
-            )
-            if offset is None or not records:
-                break
-        return out
+        return [
+            (str(r.id), r.vector, r.payload or {})
+            for r in self._scroll_pages(with_vector=True)
+            if str(r.id) not in exclude
+        ]
 
     def upsert_raw(self, point_id: str, vector: Any, payload: dict[str, Any]) -> None:
         """Re-insert a point exactly as exported (vectors already computed)."""
@@ -233,22 +241,14 @@ class EdgeBackend:
         return [Hit(id=str(p.id), score=p.score, payload=p.payload or {}) for p in results]
 
     def retrieve(self, memory_ids: list[str]) -> list[Hit]:
-        # with_vector is required positionally in the 0.7.2 binding despite
-        # the stub marking it optional.
         records = self._shard.retrieve(list(memory_ids), with_payload=True, with_vector=False)
         return [Hit(id=str(r.id), score=0.0, payload=r.payload or {}) for r in records]
 
     def scroll_all(self, flt: Filter | None = None) -> list[Hit]:
-        out: list[Hit] = []
-        offset = None
-        while True:
-            records, offset = self._shard.scroll(
-                ScrollRequest(offset=offset, limit=256, filter=flt, with_payload=True)
-            )
-            out.extend(Hit(id=str(r.id), score=0.0, payload=r.payload or {}) for r in records)
-            if offset is None or not records:
-                break
-        return out
+        return [
+            Hit(id=str(r.id), score=0.0, payload=r.payload or {})
+            for r in self._scroll_pages(flt=flt)
+        ]
 
     def count(self) -> int:
         return self._shard.info().points_count

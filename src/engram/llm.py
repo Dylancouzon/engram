@@ -17,6 +17,16 @@ from typing import Any
 _THINK_TAGS = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
+def clamp01(value: Any, default: float) -> float:
+    """Parse a model-supplied number into [0, 1], falling back to `default`
+    on null/non-numeric input. Shared by extract (importance) and resolve
+    (confidence) — a loose envelope must degrade, never crash the write."""
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
 class LocalLLM:
     PROBE_TTL = 60.0  # long-lived processes (the M1 daemon) re-probe
 
@@ -40,23 +50,25 @@ class LocalLLM:
             self._probed_at = now
         return self._available
 
+    def _request(self, payload: dict) -> urllib.request.Request:
+        return urllib.request.Request(
+            self._url + "/api/chat",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+
     def chat(self, messages: list[dict], *, temperature: float = 0.4):
         """Stream a chat completion from Ollama, yielding text chunks as they
         arrive. Silent empty generator on any failure — the caller shows a
         'model offline' state. `think` is off (qwen3) since a streamed
         response can't be regex-stripped of <think> after the fact."""
-        body = json.dumps(
-            {
-                "model": self._model,
-                "messages": messages,
-                "stream": True,
-                "think": False,
-                "options": {"temperature": temperature},
-            }
-        ).encode()
-        req = urllib.request.Request(
-            self._url + "/api/chat", data=body, headers={"Content-Type": "application/json"}
-        )
+        req = self._request({
+            "model": self._model,
+            "messages": messages,
+            "stream": True,
+            "think": False,
+            "options": {"temperature": temperature},
+        })
         try:
             resp = urllib.request.urlopen(req, timeout=self._timeout)
         except (urllib.error.URLError, TimeoutError, OSError):
@@ -85,22 +97,17 @@ class LocalLLM:
     def generate_json(self, system: str, prompt: str) -> Any | None:
         """One chat turn constrained to JSON. Returns the parsed value, or
         None on any failure — callers must have a verbatim fallback."""
-        body = json.dumps(
-            {
-                "model": self._model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                "stream": False,
-                "format": "json",
-                "think": False,  # qwen3: skip thinking tokens
-                "options": {"temperature": 0.1},
-            }
-        ).encode()
-        req = urllib.request.Request(
-            self._url + "/api/chat", data=body, headers={"Content-Type": "application/json"}
-        )
+        req = self._request({
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "format": "json",
+            "think": False,  # qwen3: skip thinking tokens
+            "options": {"temperature": 0.1},
+        })
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 content = json.loads(resp.read())["message"]["content"]

@@ -175,8 +175,6 @@ class ShardSync:
                     payload={"op": "upsert", "blob": blob, "ts": entry.ts,
                              "device": self.device},
                 ))
-            elif entry.op == "delete":
-                points.append(self._tombstone_point(entry.memory_id, entry.ts))
 
         # Tombstones for THIS shard are content-free and idempotent: always
         # propagate, so a hard forget overwrites any ciphertext still in the
