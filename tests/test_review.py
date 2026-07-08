@@ -76,6 +76,35 @@ def test_accept_update_folds_twin_into_target(config):
         store.close()
 
 
+def test_accept_update_purges_twin_verbatim_from_journal(config):
+    # Accepting an UPDATE folds the twin into the target and must leave no
+    # exportable, un-forgettable copy of the twin's verbatim text behind.
+    import io
+
+    llm = FakeLLM(judge_responses=[
+        {"op": "UPDATE", "target": 0, "confidence": 0.6,
+         "text": "Dylan's cat Miso is a grey british shorthair"},
+    ])
+    store = make_store(config, llm=llm)
+    try:
+        [first] = store.remember("Dylan's cat is named Miso")
+        [second] = store.remember(
+            "Miso is a grey british shorthair, adopted at shelter code ZZ9")
+        twin_id = second.memory.id
+        [item] = store.pending_reviews()
+        store.resolve_review(item.seq, accept=True)
+
+        assert "british shorthair" in store.get(first.memory.id).text  # merge kept
+        buf = io.StringIO()
+        store.journal.export_jsonl(buf)
+        dump = buf.getvalue()
+        assert "shelter code ZZ9" not in dump  # twin's unique text is gone
+        assert store.forget(twin_id, mode="hard") is None  # nothing left to purge
+        assert store.pending_reviews() == []
+    finally:
+        store.close()
+
+
 def test_review_survives_rebuild(config):
     """The queue and its resolution live in the journal: a rebuild
     converges to the resolved state."""

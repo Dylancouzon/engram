@@ -186,6 +186,10 @@ class MemoryStore:
         self._reinforce_mode = reinforce_mode
         self._reinforce_queue: Counter[str] = Counter()
         self._reinforce_queue_lock = threading.Lock()
+        # Shards mutated-but-not-yet-flushed by deferred reinforcement. The
+        # flush high-water mark is global while flush() is per-shard, so these
+        # must be flushed before the mark advances (see _mark_flushed).
+        self._dirty_shards: set[str] = set()
 
         # "a", not "w": never truncate before the lock is ours.
         self._lock_file = open(cfg.lock_path, "a")  # noqa: SIM115 - held for store lifetime
@@ -296,8 +300,21 @@ class MemoryStore:
         later seq flushed would hide the gap from replay forever. Freezing the
         mark keeps replay-on-open (or a rebuild) honest until the gap is
         refilled."""
-        if not self._flush_damaged:
-            self.journal.mark_flushed(seq)
+        if self._flush_damaged:
+            return
+        # Deferred reinforcement leaves a shard mutated-but-unflushed. Because
+        # the mark is global but flush() is per-shard, advancing it past those
+        # rows would strand another shard's unflushed bump — flush them first.
+        # Discard each shard only AFTER its flush succeeds; a failed flush
+        # freezes the mark (like _apply_guard) so replay-on-open stays honest.
+        try:
+            for shard in list(self._dirty_shards):
+                self.backends[shard].flush()
+                self._dirty_shards.discard(shard)
+        except BaseException:
+            self._flush_damaged = True
+            return
+        self.journal.mark_flushed(seq)
 
     @contextmanager
     def _apply_guard(self):
@@ -746,6 +763,7 @@ class MemoryStore:
             with self._apply_guard():
                 self._backend(shard).set_payload(mid, partial)
                 self._applied_seq = max(self._applied_seq, seq)
+                self._dirty_shards.add(shard)  # unflushed until the next _mark_flushed
 
     # -- forget ------------------------------------------------------------------
 
@@ -862,13 +880,17 @@ class MemoryStore:
                 target.text = item.merged_text or item.new.text
                 target.importance = max(target.importance, item.new.importance)
                 target.tags = list(dict.fromkeys(target.tags + item.new.tags))
-                # The ADDed twin folds into the target: journal the delete so
-                # a rebuild converges to the same state.
-                delete_seq = self.journal.append("delete", item.new.id,
-                                                 shard=item.shard)
-                self._backend(item.shard).delete([item.new.id])
-                self._applied_seq = max(self._applied_seq, delete_seq)
+                # Commit the merged target FIRST so the incoming fact is durable,
+                # THEN byte-purge the twin (journal rows + shard rebuild), so its
+                # verbatim text can't linger in an exportable, un-forgettable row.
+                # A crash between the two leaves the merge saved and the twin's
+                # leftover row reconciled by rebuild-from-journal on next open.
+                # The twin's `review` row is purged with it, so the review leaves
+                # the queue without a review_resolved marker — which would re-add
+                # a journal row under a now-tombstoned id.
                 self._commit_upserts([target], item.shard)
+                self._forget_locked(item.new.id, "hard")
+                return item
             resolved_seq = self.journal.append(
                 "review_resolved", item.new.id,
                 {"review_seq": seq, "accepted": accept},

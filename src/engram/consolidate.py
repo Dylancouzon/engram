@@ -55,17 +55,24 @@ def consolidate(
     """One consolidation run. Returns per-pass counts."""
     report = {"pruned": 0, "deduped": 0, "summarized": 0}
     now = now_ts()
-    # Memories awaiting an owner decision are off-limits: consolidation must
-    # not invalidate a review's target or its ADDed twin out from under it.
-    protected: set[str] = set()
-    for item in store.pending_reviews():
-        protected.add(item.new.id)
-        protected.add(item.target.id)
 
     def cancelled() -> bool:
         return stop is not None and stop.is_set()
 
+    # Phase 1 (under the write lock): the fast model-free passes — prune and
+    # dedup — plus gathering the episode groups that MIGHT be summarized. The
+    # model calls are deferred to phase 2 so the lock is never held across one
+    # (a daemon shutdown must not wait on a model call).
+    can_summarize = store.llm is not None and store.llm.available()
+    plan: list[tuple[str, str, list[Memory]]] = []  # (shard, scope, episodes)
     with store._write_lock:
+        # Memories awaiting an owner decision are off-limits: consolidation must
+        # not invalidate a review's target or its ADDed twin. Read under the
+        # lock so a review created just before phase 1 can't be missed.
+        protected: set[str] = set()
+        for item in store.pending_reviews():
+            protected.add(item.new.id)
+            protected.add(item.target.id)
         for shard, backend in list(store.backends.items()):
             valid = [
                 hit.memory()
@@ -113,8 +120,8 @@ def consolidate(
                 _soft_invalidate(store, backend, shard, m, superseded_by=prior.id)
                 report["deduped"] += 1
 
-            # -- episodic -> semantic ----------------------------------------------
-            if store.llm is not None and store.llm.available():
+            # -- gather episodic->semantic groups (model calls come in phase 2) --
+            if can_summarize:
                 groups: dict[tuple[str, str], list[Memory]] = defaultdict(list)
                 for m in valid:
                     if (m.is_valid and m.type is MemoryType.EPISODIC
@@ -122,43 +129,74 @@ def consolidate(
                         for tag in m.tags or ["untagged"]:
                             groups[(m.scope, tag)].append(m)
                 for (scope, _tag), episodes in groups.items():
-                    if cancelled():
-                        break
                     episodes = [e for e in episodes
                                 if e.is_valid and e.id not in protected]
-                    if len(episodes) < SUMMARIZE_MIN_GROUP:
-                        continue
-                    listing = "\n".join(
-                        f"- ({time.strftime('%Y-%m-%d', time.localtime(e.created_at))}) "
-                        f"{e.text}" for e in episodes
-                    )
-                    result = store.llm.generate_json(_SUMMARY_SYSTEM, listing)
-                    summary = (result or {}).get("summary") if isinstance(result, dict) else None
-                    if not summary:
-                        continue
-                    from engram.models import new_memory_id
+                    if len(episodes) >= SUMMARIZE_MIN_GROUP:
+                        plan.append((shard, scope, episodes))
+        store._mark_flushed(store._applied_seq)  # prune/dedup durable
 
-                    semantic = Memory(
-                        id=new_memory_id(store._owner_ns),
-                        text=str(summary).strip(),
-                        type=MemoryType.SEMANTIC,
-                        scope=scope,
-                        tags=sorted({t for e in episodes for t in e.tags})[:3],
-                        surface="consolidation",
-                        importance=max(e.importance for e in episodes),
-                        created_at=now,
-                        valid_from=now,
-                    )
-                    store._commit_upserts([semantic], shard)
-                    for e in episodes:
-                        _soft_invalidate(store, backend, shard, e,
-                                         superseded_by=semantic.id)
-                    report["summarized"] += 1
+    # Phase 2 (NO write lock): the model calls. A stop fired here is honored
+    # before touching the store, so shutdown never waits on a call.
+    summaries: list[tuple[str, str, list[Memory], str]] = []
+    for shard, scope, episodes in plan:
+        if cancelled():
+            break
+        listing = "\n".join(
+            f"- ({time.strftime('%Y-%m-%d', time.localtime(e.created_at))}) "
+            f"{e.text}" for e in episodes
+        )
+        result = store.llm.generate_json(_SUMMARY_SYSTEM, listing)
+        if cancelled():
+            break  # stop fired during the call: discard the result
+        summary = (result or {}).get("summary") if isinstance(result, dict) else None
+        if summary:
+            summaries.append((shard, scope, episodes, str(summary).strip()))
 
-    # Under the lock: a concurrent writer must not be mid-apply when we snapshot
-    # _applied_seq, or we could mark its not-yet-flushed row as flushed.
-    with store._write_lock:
-        store._mark_flushed(store._applied_seq)
+    # Phase 3 (under the write lock): apply summaries, re-validating the exact
+    # episodes each summary was built from. The summary text was generated in
+    # phase 2 from the episodes as they were in phase 1; if ANY of them has
+    # since been forgotten, invalidated, edited, or newly protected, the
+    # summary may carry now-stale or now-forgotten content — so discard the
+    # whole summary rather than commit a tainted derivative. Consolidation
+    # will regenerate it from current state on the next idle run.
+    if summaries and not cancelled():
+        from engram.models import new_memory_id
+        with store._write_lock:
+            fresh_protected: set[str] = set()
+            for item in store.pending_reviews():
+                fresh_protected.add(item.new.id)
+                fresh_protected.add(item.target.id)
+            for shard, scope, episodes, summary_text in summaries:
+                backend = store._backend(shard)
+                live: list[Memory] = []
+                for e in episodes:
+                    found = backend.retrieve([e.id])
+                    cur = found[0].memory() if found else None
+                    if (cur is None or not cur.is_valid
+                            or cur.id in fresh_protected or cur.text != e.text):
+                        live = []  # any changed/gone source taints the summary
+                        break
+                    live.append(cur)
+                if len(live) < SUMMARIZE_MIN_GROUP:
+                    continue
+                semantic = Memory(
+                    id=new_memory_id(store._owner_ns),
+                    text=summary_text,
+                    type=MemoryType.SEMANTIC,
+                    scope=scope,
+                    tags=sorted({t for e in live for t in e.tags})[:3],
+                    surface="consolidation",
+                    importance=max(e.importance for e in live),
+                    created_at=now,
+                    valid_from=now,
+                )
+                store._commit_upserts([semantic], shard)
+                for e in live:
+                    _soft_invalidate(store, backend, shard, e,
+                                     superseded_by=semantic.id)
+                report["summarized"] += 1
+            store._mark_flushed(store._applied_seq)
+
     if not cancelled():
         # Only a COMPLETED run advances the daily checkpoint; a cancelled
         # run should resume at the next idle window instead.

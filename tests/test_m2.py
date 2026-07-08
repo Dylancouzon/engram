@@ -117,6 +117,90 @@ def test_consolidate_summarizes_old_episode_clusters(config):
         store.close()
 
 
+def test_consolidate_does_not_hold_write_lock_during_model_call(config):
+    # The summarization model call runs in phase 2, OUTSIDE the write lock, so
+    # a daemon shutdown never blocks ~60s on an in-flight Ollama call.
+    import threading
+
+    entered = threading.Event()
+    proceed = threading.Event()
+
+    class BlockingLLM:
+        def available(self):
+            return True
+
+        def generate_json(self, system, prompt):
+            if "compress" not in system:
+                return None  # extraction/judge during setup: no-op (verbatim/ADD)
+            entered.set()
+            assert proceed.wait(5), "model call was never released"
+            return {"summary": "Dylan runs the Tuesday community call"}
+
+    store = make_store(config, llm=BlockingLLM())
+    try:
+        for week in range(3):
+            _aged(store, f"hosted the community call, week {week}", 40 + week * 7,
+                  type=MemoryType.EPISODIC, tags=["community"], importance=0.5)
+        t = threading.Thread(target=store.consolidate)
+        t.start()
+        assert entered.wait(5), "consolidation never reached the model call"
+        # Model call in flight: the write lock MUST be free.
+        got = store._write_lock.acquire(timeout=2)
+        assert got, "write lock held across the model call"
+        store._write_lock.release()
+        proceed.set()
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert any("Tuesday community call" in h.memory.text
+                   for h in store.recall("community call", k=5))
+    finally:
+        proceed.set()
+        store.close()
+
+
+def test_consolidate_discards_summary_when_source_forgotten_midrun(config):
+    # A summary is generated (phase 2) from episodes as of phase 1. If a source
+    # episode is hard-forgotten while the model runs, committing the summary
+    # would reintroduce forgotten content — so the whole summary is discarded.
+    import threading
+
+    entered = threading.Event()
+    proceed = threading.Event()
+
+    class BlockingLLM:
+        def available(self):
+            return True
+
+        def generate_json(self, system, prompt):
+            if "compress" not in system:
+                return None
+            entered.set()
+            assert proceed.wait(5), "model call was never released"
+            return {"summary": "community summary mentioning secret venue XYZ"}
+
+    store = make_store(config, llm=BlockingLLM())
+    episodes = []
+    try:
+        for week in range(3):
+            episodes.append(_aged(
+                store, f"community call week {week} at venue XYZ", 40 + week * 7,
+                type=MemoryType.EPISODIC, tags=["community"], importance=0.5))
+        t = threading.Thread(target=store.consolidate)
+        t.start()
+        assert entered.wait(5), "consolidation never reached the model call"
+        store.forget(episodes[0].id, mode="hard")  # forget a source mid-run
+        proceed.set()
+        t.join(timeout=5)
+        assert not t.is_alive()
+        hits = store.recall("community call venue", k=10)
+        assert all(h.memory.surface != "consolidation" for h in hits)  # no summary
+        assert all("secret venue" not in h.memory.text for h in hits)
+        assert store.get(episodes[1].id).is_valid  # survivors not invalidated
+    finally:
+        proceed.set()
+        store.close()
+
+
 def test_consolidate_cancel_skips_work_and_checkpoint(config):
     import threading
 

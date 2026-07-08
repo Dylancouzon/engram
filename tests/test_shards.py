@@ -7,6 +7,21 @@ from conftest import make_store
 from engram.store import validate_shard
 
 
+def test_cross_shard_reinforce_flushed_before_mark_advances(config):
+    # Deferred reinforcement leaves a shard unflushed; the flush mark is global
+    # while flush() is per-shard. A write to a DIFFERENT shard must flush the
+    # dirty shard before advancing the mark, or a crash strands the bump.
+    store = make_store(config)  # sync reinforce mode
+    try:
+        [a] = store.remember("Dylan's cat is named Miso", shard="me-synced")
+        store._reinforce([a.memory.id])  # bumps me-synced, defers its flush
+        assert "me-synced" in store._dirty_shards
+        store.remember("Dylan uses uv for Python", shard="private")
+        assert store._dirty_shards == set()  # me-synced was flushed first
+    finally:
+        store.close()
+
+
 def test_shard_names_are_a_closed_grammar():
     for good in ("private", "me-synced", "shared:family", "shared:team-a"):
         assert validate_shard(good) == good

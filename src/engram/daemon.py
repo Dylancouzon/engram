@@ -342,7 +342,7 @@ class Daemon:
 
     def _m_consolidate(self, params: dict, scopes: list[str], client: str) -> dict:
         _check_scope(scopes, "*")
-        return self.store.consolidate()
+        return self.store.consolidate(stop=self._stop)  # cancellable on shutdown
 
     def _m_log_event(self, params: dict, scopes: list[str], client: str) -> dict:
         self.store.log_event(str(params["kind"]), int(params.get("hits", 0)))
