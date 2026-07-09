@@ -340,7 +340,9 @@ class Daemon:
         return self.store.consolidate(stop=self._stop)  # cancellable on shutdown
 
     def _m_log_event(self, params: dict, scopes: list[str], client: str) -> dict:
-        self.store.log_event(str(params["kind"]), int(params.get("hits", 0)))
+        detail = params.get("detail")
+        self.store.log_event(str(params["kind"]), int(params.get("hits", 0)),
+                             str(detail) if detail is not None else None)
         return {"logged": True}
 
     def _m_events(self, params: dict, scopes: list[str], client: str) -> dict:

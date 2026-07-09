@@ -58,6 +58,11 @@ CREATE TABLE IF NOT EXISTS events (
     ts REAL NOT NULL,
     hits INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS event_details (
+    slot INTEGER PRIMARY KEY,        -- fixed-size ring; detail-bearing events only
+    event_id INTEGER NOT NULL UNIQUE,
+    detail TEXT NOT NULL             -- JSON: prompt + surfaced/saved texts, newest N only
+);
 """
 
 
@@ -79,6 +84,11 @@ class JournalEntry:
 
 
 class Journal:
+    # Keep the prompt/surfaced/saved text of only the newest few events, so the
+    # activity view stays useful without the events table growing text forever.
+    _DETAIL_KEEP = 50
+    _DETAIL_NEXT_KEY = "event_detail_next_slot"
+
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         existed = path.exists()
@@ -107,6 +117,29 @@ class Journal:
             self._conn.execute(
                 "ALTER TABLE tombstones ADD COLUMN shard TEXT NOT NULL DEFAULT 'private'"
             )
+        ecols = {r[1] for r in self._conn.execute("PRAGMA table_info(events)")}
+        if "detail" in ecols:
+            # Interim builds stored detail inline on the append-only events row.
+            # Move the newest kept details into the bounded ring table and clear
+            # inline text so future writes do not grow old event pages forever.
+            rows = self._conn.execute(
+                "SELECT id, detail FROM events WHERE detail IS NOT NULL "
+                "ORDER BY id DESC LIMIT ?",
+                (self._DETAIL_KEEP,),
+            ).fetchall()
+            if rows:
+                for slot, (event_id, detail) in enumerate(reversed(rows)):
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO event_details (slot, event_id, detail) "
+                        "VALUES (?, ?, ?)",
+                        (slot, event_id, detail),
+                    )
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    (self._DETAIL_NEXT_KEY, str(len(rows))),
+                )
+                self._conn.execute(
+                    "UPDATE events SET detail = NULL WHERE detail IS NOT NULL")
         self._conn.commit()
 
     # -- append (the ack point) -------------------------------------------
@@ -320,20 +353,40 @@ class Journal:
 
     # -- trigger measurement ---------------------------------------------------
 
-    def log_event(self, kind: str, hits: int = 0) -> None:
+    def log_event(self, kind: str, hits: int = 0, detail: str | None = None) -> None:
         """Operational counters (proactive-trigger measurement), not memory
-        content: excluded from export, ignored by replay."""
+        content: excluded from export, ignored by replay. `detail` (a small
+        JSON snippet) is retained for the newest `_DETAIL_KEEP` events only."""
         with self._lock, self._conn:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "INSERT INTO events (kind, ts, hits) VALUES (?, ?, ?)",
                 (kind, time.time(), hits),
             )
+            if detail is not None:
+                row = self._conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (self._DETAIL_NEXT_KEY,),
+                ).fetchone()
+                next_slot = int(row[0]) if row else 0
+                slot = next_slot % self._DETAIL_KEEP
+                self._conn.execute(
+                    "INSERT INTO event_details (slot, event_id, detail) VALUES (?, ?, ?) "
+                    "ON CONFLICT(slot) DO UPDATE SET "
+                    "event_id = excluded.event_id, detail = excluded.detail",
+                    (slot, cur.lastrowid, detail),
+                )
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    (self._DETAIL_NEXT_KEY, str(next_slot + 1)),
+                )
 
-    def recent_events(self, limit: int = 50) -> list[tuple[str, float, int]]:
-        """Newest firings first: (kind, ts, hits) — feeds `engram log`."""
+    def recent_events(self, limit: int = 50) -> list[tuple[str, float, int, str | None]]:
+        """Newest firings first: (kind, ts, hits, detail) — feeds `engram log`."""
         with self._lock:
             return self._conn.execute(
-                "SELECT kind, ts, hits FROM events ORDER BY id DESC LIMIT ?",
+                "SELECT e.kind, e.ts, e.hits, d.detail "
+                "FROM events e LEFT JOIN event_details d ON d.event_id = e.id "
+                "ORDER BY e.id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
 

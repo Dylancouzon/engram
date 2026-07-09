@@ -180,8 +180,8 @@ class Client:
         )
         return [memory_from_wire(m) for m in result["memories"]]
 
-    def log_event(self, kind: str, hits: int = 0) -> None:
-        self.call("log_event", kind=kind, hits=hits)
+    def log_event(self, kind: str, hits: int = 0, detail: str | None = None) -> None:
+        self.call("log_event", kind=kind, hits=hits, detail=detail)
 
     def recent_events(self, limit: int = 50) -> list[dict]:
         return list(self.call("events", limit=limit)["events"])

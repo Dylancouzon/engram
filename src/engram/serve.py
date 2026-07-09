@@ -392,6 +392,15 @@ button.act.pri { background: var(--accent); color: #1a1206; border-color: var(--
 .mem.open .tools { display: flex; }
 .mem input, .mem select { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
   border-radius: 5px; padding: 0.2rem 0.4rem; font: inherit; font-size: 0.76rem; }
+.evt { border: 1px solid var(--line); border-radius: 8px; padding: 0.55rem 0.65rem;
+  margin-bottom: 0.6rem; background: var(--surface-2); }
+.evt .hd { display: flex; gap: 0.5rem; align-items: baseline; font-size: 0.72rem; color: var(--ink-3); }
+.evt .kind { color: var(--accent); font-weight: 600; }
+.evt .prompt { font-size: 0.85rem; margin: 0.35rem 0; }
+.evt ul { list-style: none; margin: 0.3rem 0 0; padding: 0; }
+.evt li { font-size: 0.78rem; color: var(--ink-2); padding: 0.15rem 0 0.15rem 0.8rem;
+  border-left: 2px solid var(--line); margin-bottom: 0.2rem; }
+.evt .lbl { font-size: 0.72rem; color: var(--ink-3); margin-top: 0.4rem; }
 .field { display: block; width: 100%; margin-bottom: 0.5rem; }
 textarea#add { width: 100%; min-height: 3.4rem; resize: vertical; background: var(--bg);
   color: var(--ink); border: 1px solid var(--line); border-radius: 7px; padding: 0.45rem; font: inherit; }
@@ -459,6 +468,7 @@ textarea#add { width: 100%; min-height: 3.4rem; resize: vertical; background: va
     <div class="panel">
       <div class="tabs">
         <button data-tab="memories" class="on">Memories</button>
+        <button data-tab="activity">Activity</button>
         <button data-tab="chat">Chat</button>
         <button data-tab="docs">Docs</button>
       </div>
@@ -470,6 +480,11 @@ textarea#add { width: 100%; min-height: 3.4rem; resize: vertical; background: va
           <button class="act pri" id="addbtn">Remember</button>
         </div>
         <div id="memlist"></div>
+      </div>
+      <div class="tabbody" data-body="activity" hidden>
+        <p class="stat" style="margin-bottom:0.7rem">The latest prompts engram saw, what it
+          surfaced to your assistant, and what it captured. Newest first.</p>
+        <div id="activity"></div>
       </div>
       <div class="tabbody" data-body="chat" hidden>
         <div class="chatpane">
@@ -608,7 +623,27 @@ async function load() {
   MAP = initMap({ data: STATE, canvas: $("#map"), tip: $("#maptip"), legend: $("#legend"),
     colorButtons: document.querySelectorAll(".maptools [data-mode]"),
     onPick: m => { if (m) { switchTab("memories"); openMem(m.id); } } });
-  renderReviews(); renderMems();
+  renderReviews(); renderMems(); renderActivity();
+}
+
+const EVT_LABEL = { "prompt-recall": "prompt", "session-start-recall": "session start",
+  "auto-capture": "captured" };
+function renderActivity() {
+  const box = $("#activity");
+  const evs = (STATE.events || []).filter(e => e.detail);
+  if (!evs.length) { box.innerHTML = `<p class="stat">No activity captured yet. Install the hooks
+    (<code>engram hook install claude-code</code>) and use Claude Code — prompts and captures show up here.</p>`;
+    return; }
+  const when = ts => new Date(ts * 1000).toLocaleString();
+  const list = (label, items) => items && items.length
+    ? `<div class="lbl">${label}</div><ul>${items.map(t => `<li>${esc(t)}</li>`).join("")}</ul>` : "";
+  box.innerHTML = evs.map(e => { const d = e.detail || {};
+    return `<div class="evt"><div class="hd"><span class="kind">${esc(EVT_LABEL[e.kind] || e.kind)}</span>
+      <span>${esc(when(e.ts))}</span></div>
+      ${d.prompt ? `<div class="prompt">${esc(d.prompt)}</div>` : ""}
+      ${list("surfaced to assistant", d.surfaced)}
+      ${list("saved to memory", d.saved)}</div>`;
+  }).join("");
 }
 
 function renderReviews() {

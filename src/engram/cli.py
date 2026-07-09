@@ -653,6 +653,22 @@ def hook() -> None:
     """Proactive recall triggers for assistant surfaces."""
 
 
+def _activity_detail(prompt: str | None = None, surfaced: list[str] | None = None,
+                     saved: list[str] | None = None) -> str:
+    """A small JSON snippet for the serve activity view. The prompt is scrubbed
+    (raw user input never lands, even in this read-only log); memory texts are
+    already-redacted stored content. Bounded so the events table stays small."""
+    from engram.redact import redact
+    d: dict = {}
+    if prompt:
+        d["prompt"] = redact(prompt).text[:500]
+    if surfaced:
+        d["surfaced"] = [t[:200] for t in surfaced[:8]]
+    if saved:
+        d["saved"] = [t[:200] for t in saved[:8]]
+    return json.dumps(d, ensure_ascii=False)
+
+
 @hook.command("session-start")
 @click.option("--scope", default=None)
 @click.option("-k", type=int, default=5)
@@ -676,7 +692,8 @@ def hook_session_start(data_dir: str | None, scope: str | None, k: int,
         # gets k random nearest neighbours injected every session start.
         raw = store.recall(query, k=k * 3, scope=scope, reinforce=False)
         hits = [h for h in raw if h.similarity >= min_score][:k]
-        store.log_event("session-start-recall", hits=len(hits))
+        store.log_event("session-start-recall", hits=len(hits),
+                        detail=_activity_detail(surfaced=[h.memory.text for h in hits]))
         pending = len(store.pending_reviews())
     if hits:
         click.echo(f"## Relevant long-term memories (engram, project {cwd.name})")
@@ -711,7 +728,9 @@ def hook_user_prompt(data_dir: str | None, scope: str | None, k: int,
         # crowd out an on-topic one before the gate ever sees it.
         raw = store.recall(prompt, k=k * 3, scope=scope, reinforce=False)
         hits = [h for h in raw if h.similarity >= min_score][:k]
-        store.log_event("prompt-recall", hits=len(hits))
+        store.log_event("prompt-recall", hits=len(hits),
+                        detail=_activity_detail(prompt=prompt,
+                                                surfaced=[h.memory.text for h in hits]))
     if not hits:
         return
     click.echo("<engram-memories>")
@@ -773,7 +792,9 @@ def hook_capture(data_dir: str | None, scope: str, max_chars: int) -> None:
             return
         actions = store.remember(tail, scope=scope, surface="auto-capture",
                                  source_ref=str(transcript_path))
-        store.log_event("auto-capture", hits=len(actions))
+        saved = [f"{a.op.value}: {a.memory.text}" for a in actions if a.memory]
+        store.log_event("auto-capture", hits=len(actions),
+                        detail=_activity_detail(saved=saved))
 
 
 @hook.command("install")

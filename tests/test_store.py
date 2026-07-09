@@ -359,6 +359,89 @@ def test_dashboard_renders_memories_and_events(store):
     assert "</" not in payload
 
 
+def test_event_detail_roundtrips_and_prunes_to_newest(store):
+    import json
+
+    from engram.journal import Journal
+
+    store.log_event("prompt-recall", hits=1,
+                    detail=json.dumps({"prompt": "hi", "surfaced": ["a fact"]}))
+    got = store.recent_events(1)[0]
+    assert got["detail"] == {"prompt": "hi", "surfaced": ["a fact"]}
+
+    # Only the newest _DETAIL_KEEP events retain their detail text; older ones
+    # keep the row (the counter) but drop the text so storage stays bounded.
+    keep = Journal._DETAIL_KEEP
+    for i in range(keep + 5):
+        store.log_event("prompt-recall", hits=1, detail=json.dumps({"prompt": f"p{i}"}))
+    with_detail = [e for e in store.recent_events(keep + 20) if e["detail"]]
+    assert len(with_detail) == keep
+    # And events without detail still record (the metric is intact).
+    store.log_event("prompt-recall", hits=0)
+    assert store.recent_events(1)[0]["detail"] is None
+
+
+def test_event_detail_malformed_degrades_not_crashes(store):
+    # A non-cli client could store a non-JSON detail string; one bad row must
+    # not crash the whole events read (serve /api/state, `engram log`).
+    store.journal.log_event("prompt-recall", hits=1, detail="{not json")
+    store.log_event("prompt-recall", hits=1, detail='{"prompt": "ok"}')
+    events = store.recent_events(10)  # must not raise
+    assert {"prompt": "ok"} in [e["detail"] for e in events]
+    assert None in [e["detail"] for e in events]
+
+
+def test_event_detail_prune_counts_only_detail_rows(store):
+    import json
+
+    store.log_event("prompt-recall", hits=1, detail=json.dumps({"prompt": "first"}))
+    for _ in range(49):
+        store.log_event("prompt-recall", hits=0)
+    store.log_event("prompt-recall", hits=1, detail=json.dumps({"prompt": "second"}))
+
+    got = [e["detail"]["prompt"] for e in store.recent_events(60) if e["detail"]]
+    assert got == ["second", "first"]
+
+
+def test_event_detail_inline_migration_does_not_reset_ring(tmp_path):
+    import json
+    import sqlite3
+
+    from engram.journal import Journal
+
+    path = tmp_path / "journal.db"
+    j = Journal(path)
+    j.close()
+
+    conn = sqlite3.connect(path)
+    with conn:
+        conn.execute("ALTER TABLE events ADD COLUMN detail TEXT")
+        conn.execute(
+            "INSERT INTO events (kind, ts, hits, detail) VALUES (?, ?, ?, ?)",
+            ("prompt-recall", 1.0, 1, json.dumps({"prompt": "first"})),
+        )
+        conn.execute(
+            "INSERT INTO events (kind, ts, hits, detail) VALUES (?, ?, ?, ?)",
+            ("prompt-recall", 2.0, 1, json.dumps({"prompt": "second"})),
+        )
+    conn.close()
+
+    migrated = Journal(path)
+    migrated.close()
+    reopened = Journal(path)
+    try:
+        reopened.log_event("prompt-recall", hits=1,
+                           detail=json.dumps({"prompt": "third"}))
+        got = [
+            json.loads(detail)["prompt"]
+            for _kind, _ts, _hits, detail in reopened.recent_events(10)
+            if detail
+        ]
+        assert got == ["third", "second", "first"]
+    finally:
+        reopened.close()
+
+
 def test_flush_damaged_surfaces_in_stats(store):
     """A post-ack Edge-apply failure freezes the flush mark; stats() must
     surface it so a silent durability freeze isn't invisible."""

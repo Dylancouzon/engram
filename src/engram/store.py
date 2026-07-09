@@ -83,6 +83,18 @@ def _normalize(text: str) -> str:
     return re.sub(r"[\W_]+", " ", text.lower()).strip()
 
 
+def _load_detail(detail: str | None) -> dict | None:
+    """Parse a stored event detail. One malformed row (e.g. a non-cli client
+    stored a non-JSON string) must not crash the whole activity read — the
+    events view and `engram log` degrade that row to no-detail instead."""
+    if not detail:
+        return None
+    try:
+        return json.loads(detail)
+    except (ValueError, TypeError):
+        return None
+
+
 class _ShardGuard:
     """Readers-writer guard for the Edge backend's *lifetime* (not its data:
     Edge tolerates reads interleaving with writes). Queries take shared
@@ -1024,15 +1036,18 @@ class MemoryStore:
                 self._backend("private")
         return self._replay(self.journal.entries())
 
-    def log_event(self, kind: str, hits: int = 0) -> None:
-        """Record a proactive-trigger firing (hook recall/capture)."""
-        self.journal.log_event(kind, hits)
+    def log_event(self, kind: str, hits: int = 0, detail: str | None = None) -> None:
+        """Record a proactive-trigger firing (hook recall/capture). `detail` is
+        a small JSON snippet (prompt + surfaced/saved texts) kept for the
+        newest few events so `engram serve` can show recent activity."""
+        self.journal.log_event(kind, hits, detail)
 
     def recent_events(self, limit: int = 50) -> list[dict]:
         """Newest trigger firings first — what the hooks did and when."""
         return [
-            {"kind": kind, "ts": ts, "hits": hits}
-            for kind, ts, hits in self.journal.recent_events(limit)
+            {"kind": kind, "ts": ts, "hits": hits,
+             "detail": _load_detail(detail)}
+            for kind, ts, hits, detail in self.journal.recent_events(limit)
         ]
 
     def stats(self) -> dict:
