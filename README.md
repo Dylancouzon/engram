@@ -166,6 +166,21 @@ uv run engram daemon --install  # start at login (macOS launchd)
 The daemon keeps recall warm for the hooks. On Linux, run `engram daemon`
 yourself (or wrap it in a systemd user unit).
 
+### Upgrade
+
+```bash
+git pull
+uv sync
+```
+
+The daemon doesn't hot-reload code — if one is already running, restart it:
+
+```bash
+pkill -TERM -f "engram daemon"
+```
+
+It respawns on the next command (or at login, if installed with `--install`).
+
 ### Uninstall
 
 ```bash
