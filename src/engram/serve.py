@@ -605,7 +605,7 @@ const TOKEN = "__TOKEN__";
 const H = { "X-Engram-Token": TOKEN, "Content-Type": "application/json" };
 const esc = s => { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; };
 const $ = s => document.querySelector(s);
-let STATE = null, MAP = null;
+let STATE = null, MAP = null, catFilter = null;
 
 function toast(m) { const t = $("#toast"); t.textContent = m; t.classList.add("on");
   setTimeout(() => t.classList.remove("on"), 1800); }
@@ -617,11 +617,13 @@ async function api(path, body) {
 
 async function load() {
   STATE = await (await fetch("/api/state", { headers: { "X-Engram-Token": TOKEN } })).json();
+  catFilter = null;  // fresh map is rebuilt below with no active filter — keep the list in sync
   const s = STATE.stats;
   $("#hstat").innerHTML = `<b>${s.points}</b> memories · <b>${Object.keys(s.shards||{}).length}</b> shards`
     + ` · ${esc(s.disk?.data||"")} on disk · ${esc(s.extraction||"")}`;
   MAP = initMap({ data: STATE, canvas: $("#map"), tip: $("#maptip"), legend: $("#legend"),
     colorButtons: document.querySelectorAll(".maptools [data-mode]"),
+    onCategory: cf => { catFilter = cf; renderMems(); },
     onPick: m => { if (m) { switchTab("memories"); openMem(m.id); } } });
   renderReviews(); renderMems(); renderActivity();
 }
@@ -676,7 +678,8 @@ function memHtml(m) {
 }
 function renderMems() {
   const box = $("#memlist");
-  box.innerHTML = STATE.memories.map(memHtml).join("");
+  const mems = catFilter ? STATE.memories.filter(m => m[catFilter.mode] === catFilter.value) : STATE.memories;
+  box.innerHTML = mems.map(memHtml).join("");
   box.querySelectorAll(".mem").forEach(el => {
     el.querySelector(".t").onclick = () => el.classList.toggle("open");
     el.querySelectorAll("[data-do]").forEach(b => b.onclick = e => { e.stopPropagation(); memAction(el, b.dataset.do); });

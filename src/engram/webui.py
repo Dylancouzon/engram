@@ -52,7 +52,7 @@ function initMap(cfg) {
   const view = { scale: 1, ox: 0, oy: 0 };
   let colorMode = cfg.colorMode ||
     (new Set(nodes.map(n => n.m.scope)).size > 1 ? "scope" : "type");
-  let hover = null, selected = null, filter = "", highlit = null;
+  let hover = null, selected = null, filter = "", highlit = null, catFilter = null;
 
   const esc = s => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
   // Category->color computed once per colorMode change, not per node per frame:
@@ -67,7 +67,8 @@ function initMap(cfg) {
   const times = nodes.map(n => n.m.created_at);
   const lo = Math.min(...times), hi = Math.max(...times);
   const ageAlpha = n => 0.5 + 0.5 * ((n.m.created_at - lo) / ((hi - lo) || 1));
-  const shown = n => (!filter ||
+  const inCat = n => !catFilter || n.m[catFilter.mode] === catFilter.value;
+  const shown = n => inCat(n) && (!filter ||
     (n.m.text + " " + n.m.tags.join(" ") + " " + n.m.scope).toLowerCase().includes(filter));
 
   function fit() {
@@ -182,7 +183,8 @@ function initMap(cfg) {
     if (cfg.onPick) cfg.onPick(n ? n.m : null, n);
   });
   canvas.addEventListener("dblclick", () => {
-    view.scale = 1; view.ox = 0; view.oy = 0; selected = null; highlit = null; draw();
+    view.scale = 1; view.ox = 0; view.oy = 0; selected = null; highlit = null;
+    if (catFilter) setCategory(null); else draw();
   });
 
   if (cfg.colorButtons) cfg.colorButtons.forEach(b => {
@@ -190,13 +192,27 @@ function initMap(cfg) {
     b.onclick = () => {
       colorMode = b.dataset.mode;
       cfg.colorButtons.forEach(x => x.classList.toggle("on", x.dataset.mode === colorMode));
+      setCategory(null);  // categories differ per mode; drop any active filter
       recolor(); buildLegend(); draw();
     };
   });
+  // Click a legend entry to show only that category (scope/type); click again to clear.
+  function setCategory(c) {
+    catFilter = c ? { mode: colorMode, value: c } : null;
+    buildLegend(); draw();
+    if (cfg.onCategory) cfg.onCategory(catFilter);
+  }
   function buildLegend() {
     if (!cfg.legend) return;
-    cfg.legend.innerHTML = cats.map(c =>
-      `<span><i style="background:${catColor.get(c)}"></i>${esc(c)}</span>`).join("");
+    cfg.legend.innerHTML = cats.map((c, i) => {
+      const on = catFilter && catFilter.value === c;
+      return `<span data-i="${i}" style="cursor:pointer;${on ? "font-weight:700;text-decoration:underline" : ""}">`
+        + `<i style="background:${catColor.get(c)}"></i>${esc(c)}</span>`;
+    }).join("");
+    cfg.legend.querySelectorAll("[data-i]").forEach(el => el.onclick = () => {
+      const c = cats[+el.dataset.i];
+      setCategory(catFilter && catFilter.value === c ? null : c);
+    });
   }
   recolor();
   buildLegend();
@@ -204,6 +220,7 @@ function initMap(cfg) {
 
   return {
     setFilter: s => { filter = (s || "").toLowerCase(); draw(); },
+    setCategory,
     highlight: ids => { highlit = ids && ids.size ? ids : null; draw(); },
     select: id => { selected = byId.get(id) || null; draw(); },
   };
