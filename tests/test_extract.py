@@ -195,3 +195,24 @@ def test_durable_fact_not_demoted():
          "importance": 0.7}]})
     [fact] = extract("Dylan prefers concise READMEs", llm)
     assert fact.type is MemoryType.SEMANTIC and fact.importance == 0.7
+
+
+def test_transient_input_demotes_even_when_wording_washed_out():
+    # Raw input is a bug report; the model rewrites it into a neutral fact with
+    # no transient keyword. The 1:1 input-level guard still demotes it.
+    llm = EnvelopeLLM({"memories": [
+        {"text": "the autoplay route returns a 500", "type": "semantic",
+         "importance": 0.8}]})
+    [fact] = extract("the autoplay route is currently broken", llm)
+    assert fact.type is MemoryType.EPISODIC and fact.importance <= 0.4
+
+
+def test_transient_mention_does_not_demote_multi_fact_split():
+    # A session tail that mentions a bug but also states a durable fact must
+    # not drag the durable fact down — input-level demotion is 1:1 only.
+    llm = EnvelopeLLM({"memories": [
+        {"text": "the build is currently broken", "type": "semantic", "importance": 0.5},
+        {"text": "Dylan prefers concise READMEs", "type": "semantic", "importance": 0.7}]})
+    facts = extract("the build is currently broken. also Dylan prefers concise READMEs", llm)
+    durable = [f for f in facts if "READMEs" in f.text][0]
+    assert durable.type is MemoryType.SEMANTIC and durable.importance == 0.7

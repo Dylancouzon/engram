@@ -29,8 +29,8 @@ _REDACTION = re.compile(r"\[REDACTED:[^\]]*\]")
 # transient notes still slip through as semantic.
 _TRANSIENT = re.compile(
     r"(?i)\b(broken|not working|doesn'?t work|does not work|failing|crashing|"
-    r"erroring|throws? an? error|hangs|stuck|currently|right now|at the moment|"
-    r"for now|not yet (?:working|fixed|done))\b"
+    r"erroring|throws?|throwing|exception|\w*error|hangs|stuck|currently|"
+    r"right now|at the moment|for now|not yet (?:working|fixed|done))\b"
 )
 _TRANSIENT_MAX_IMPORTANCE = 0.4  # keep transient notes out of the sticky high band
 
@@ -86,6 +86,12 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
     if llm is None or not llm.available():
         return [ExtractedFact(text=text.strip(), verbatim=True)]
 
+    # Extraction often neutralizes transient wording ("X is currently broken" ->
+    # "X throws a SyntaxError"), so the demotion below also checks the raw input,
+    # but only demotes when it maps 1:1 to a single fact — a multi-fact session
+    # tail that merely mentions a bug must not drag durable facts down with it.
+    input_transient = bool(_TRANSIENT.search(text))
+
     result = llm.generate_json(_SYSTEM, text)
     # Small local models are loose about the envelope: accept the documented
     # {"memories": [...]}, a bare list, or a single bare memory object.
@@ -126,6 +132,12 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
         facts.append(ExtractedFact(text=fact_text, type=mtype,
                                    importance=importance, tags=tags,
                                    general=item.get("general") is True))
+
+    # Raw input was transient but the extractor washed the wording out of the
+    # one fact it produced — demote that fact too. Only for a clean 1:1 mapping.
+    if input_transient and len(facts) == 1 and facts[0].type is not MemoryType.EPISODIC:
+        facts[0].type = MemoryType.EPISODIC
+        facts[0].importance = min(facts[0].importance, _TRANSIENT_MAX_IMPORTANCE)
 
     if not facts:
         # Honor a real "nothing salient" judgment (the model gave usable items
