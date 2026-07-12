@@ -7,7 +7,7 @@ from conftest import FakeEmbedder, FakeLLM, make_store
 
 from engram.archive import read_snapshot, restore_snapshot
 from engram.config import Config
-from engram.models import MemoryType, now_ts
+from engram.models import Memory, MemoryType, new_memory_id, now_ts
 from engram.store import MemoryStore
 
 
@@ -238,5 +238,94 @@ def test_consolidate_cancel_skips_work_and_checkpoint(config):
         report = store.consolidate()
         assert report["pruned"] == 6
         assert last_run(store) > 0.0
+    finally:
+        store.close()
+
+
+# -- near-dedup: same fact, reworded by extraction across repeated captures --
+# (exact-text dedup above only catches identical normalized text)
+
+_VERCEL_A = "Dylan got an email from Vercel about billing changes for the account"
+_VERCEL_B = "Dylan received an email from Vercel about billing changes for the account"
+
+
+def test_consolidate_near_dedup_collapses_reworded_duplicate(config):
+    store = make_store(config)
+    try:
+        older = Memory(id=new_memory_id(store._owner_ns), text=_VERCEL_A,
+                        scope="personal", importance=0.3, access_count=2)
+        newer = Memory(id=new_memory_id(store._owner_ns), text=_VERCEL_B,
+                        scope="personal", importance=0.9, access_count=5)
+        store._commit_upserts([older])
+        time.sleep(0.01)
+        store._commit_upserts([newer])
+        report = store.consolidate()
+        assert report["near_deduped"] == 1
+        survivor = store.get(older.id)
+        assert survivor.is_valid
+        assert survivor.importance == 0.9  # max of the two
+        assert survivor.access_count == 7  # summed
+        collapsed = store.get(newer.id)
+        assert not collapsed.is_valid
+        assert collapsed.superseded_by == older.id
+    finally:
+        store.close()
+
+
+def test_consolidate_near_dedup_respects_scope_and_type(config):
+    # Same near-duplicate pair, but different scope: must not collapse across
+    # a trust/context boundary just because the text is similar.
+    store = make_store(config)
+    try:
+        a = Memory(id=new_memory_id(store._owner_ns), text=_VERCEL_A, scope="personal")
+        b = Memory(id=new_memory_id(store._owner_ns), text=_VERCEL_B, scope="work")
+        store._commit_upserts([a])
+        time.sleep(0.01)
+        store._commit_upserts([b])
+        report = store.consolidate()
+        assert report["near_deduped"] == 0
+        assert store.get(a.id).is_valid
+        assert store.get(b.id).is_valid
+    finally:
+        store.close()
+
+
+def test_consolidate_near_dedup_skips_protected_memory(config):
+    # A memory awaiting an owner decision (pending review) must not be folded
+    # into another memory by an unrelated automatic pass.
+    store = make_store(config)
+    try:
+        a = Memory(id=new_memory_id(store._owner_ns), text=_VERCEL_A, scope="personal")
+        b = Memory(id=new_memory_id(store._owner_ns), text=_VERCEL_B, scope="personal")
+        other = Memory(id=new_memory_id(store._owner_ns), text="unrelated fact about kayaking")
+        store._commit_upserts([a, other])
+        time.sleep(0.01)
+        store._commit_upserts([b])
+        store.journal.append(
+            "review", other.id,
+            {"proposed_op": "UPDATE", "target_id": a.id, "confidence": 0.6,
+             "merged_text": None},
+            shard="private",
+        )
+        assert store.pending_reviews()  # sanity: the review is live, `a` protected
+        report = store.consolidate()
+        assert report["near_deduped"] == 0
+        assert store.get(a.id).is_valid
+        assert store.get(b.id).is_valid
+    finally:
+        store.close()
+
+
+def test_consolidate_report_has_explanatory_fields(config):
+    store = make_store(config)
+    try:
+        store.remember("Dylan's cat is named Miso")
+        report = store.consolidate()
+        assert set(report) == {
+            "pruned", "deduped", "near_deduped", "summarized",
+            "examined", "too_young",
+        }
+        assert report["examined"] >= 1
+        assert report["too_young"] == 0  # fresh semantic memory, not episodic
     finally:
         store.close()

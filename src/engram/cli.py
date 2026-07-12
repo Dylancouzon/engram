@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
 import sys
 import uuid
@@ -653,6 +654,24 @@ def hook() -> None:
     """Proactive recall triggers for assistant surfaces."""
 
 
+def _project_scope(payload: dict) -> str | None:
+    """project:<dirname>, derived from the hook payload's cwd — memories
+    captured in one project don't recall into an unrelated one. None
+    outside a known cwd."""
+    cwd = payload.get("cwd")
+    return f"project:{Path(cwd).name.lower()}" if cwd else None
+
+
+def _hook_recall_scope(scope: str | None, payload: dict) -> str | list[str] | None:
+    """An explicit --scope always wins. Otherwise recall the current
+    project plus "default" (pre-scoping capture data), so another
+    project's memories don't crowd this one out."""
+    if scope is not None:
+        return scope
+    project = _project_scope(payload)
+    return [project, "default"] if project else None
+
+
 def _activity_detail(prompt: str | None = None, surfaced: list[str] | None = None,
                      saved: list[str] | None = None) -> str:
     """A small JSON snippet for the serve activity view. The prompt is scrubbed
@@ -685,12 +704,13 @@ def hook_session_start(data_dir: str | None, scope: str | None, k: int,
     payload = _hook_payload()
     cwd = Path(payload.get("cwd") or Path.cwd())
     query = f"project {cwd.name} preferences conventions decisions corrections"
+    recall_scope = _hook_recall_scope(scope, payload)
     with _open_surface(data_dir) as store:
         # Gate on RAW similarity, and over-fetch before the gate so a genuinely
         # on-topic hit isn't crowded out of the top-k by the recency/importance
         # rescore before it's even scored. Without the gate an unrelated repo
         # gets k random nearest neighbours injected every session start.
-        raw = store.recall(query, k=k * 3, scope=scope, reinforce=False)
+        raw = store.recall(query, k=k * 3, scope=recall_scope, reinforce=False)
         hits = [h for h in raw if h.similarity >= min_score][:k]
         store.log_event("session-start-recall", hits=len(hits),
                         detail=_activity_detail(surfaced=[h.memory.text for h in hits]))
@@ -722,11 +742,12 @@ def hook_user_prompt(data_dir: str | None, scope: str | None, k: int,
     prompt = (payload.get("prompt") or "").strip()
     if len(prompt) < 12:  # nothing to match against
         return
+    recall_scope = _hook_recall_scope(scope, payload)
     with _open_surface(data_dir) as store:
         # Over-fetch, gate on RAW similarity, then cap: filtering the already
         # top-k-by-blended-score list would let a fresh-but-off-topic memory
         # crowd out an on-topic one before the gate ever sees it.
-        raw = store.recall(prompt, k=k * 3, scope=scope, reinforce=False)
+        raw = store.recall(prompt, k=k * 3, scope=recall_scope, reinforce=False)
         hits = [h for h in raw if h.similarity >= min_score][:k]
         store.log_event("prompt-recall", hits=len(hits),
                         detail=_activity_detail(prompt=prompt,
@@ -746,8 +767,13 @@ def hook_user_prompt(data_dir: str | None, scope: str | None, k: int,
 _USER_ENTERED = ("typed", "queued", "suggestion_accepted")
 
 
-def _transcript_tail(transcript_path: str, max_chars: int) -> str:
-    """The tail of what the user actually entered, injected turns removed."""
+def _transcript_tail(transcript_path: str, max_chars: int,
+                     mark: int = 0) -> tuple[str, int]:
+    """The NEW text since `mark` (a count of prior user-entered entries),
+    injected turns removed, tail-capped to max_chars. Returns (text,
+    new_mark) — the caller persists new_mark so a re-run only sees what's
+    been appended since. Transcripts are append-only, so counting entries
+    (not chars) is a stable position to resume from."""
     texts: list[str] = []
     for line in Path(transcript_path).read_text(errors="replace").splitlines():
         try:
@@ -765,25 +791,55 @@ def _transcript_tail(transcript_path: str, max_chars: int) -> str:
         elif isinstance(content, list):
             texts.extend(b.get("text", "") for b in content
                          if isinstance(b, dict) and b.get("type") == "text")
-    return "\n".join(t for t in texts if t and not t.startswith("<"))[-max_chars:]
+    texts = [t for t in texts if t and not t.startswith("<")]
+    return "\n".join(texts[mark:])[-max_chars:], len(texts)
+
+
+# capture-marks.json: {transcript_path: entries already processed}. Hook-side
+# only (not through the daemon/journal) — it's a resume position, not memory
+# content, and every capture already replays fine from mark 0 if it's lost.
+_CAPTURE_MARKS_FILE = "capture-marks.json"
+_MAX_TRACKED_TRANSCRIPTS = 50  # oldest dropped first; bounds the file for long-lived installs
+
+
+def _load_marks(data_dir: str | None) -> dict[str, int]:
+    path = _config(data_dir).data_dir / _CAPTURE_MARKS_FILE
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}  # missing/corrupt -> full-tail capture, same as today
+
+
+def _save_marks(data_dir: str | None, marks: dict[str, int]) -> None:
+    if len(marks) > _MAX_TRACKED_TRANSCRIPTS:
+        marks = dict(list(marks.items())[-_MAX_TRACKED_TRANSCRIPTS:])
+    path = _config(data_dir).data_dir / _CAPTURE_MARKS_FILE
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(marks))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
 
 
 @hook.command("capture")
-@click.option("--scope", default="default")
+@click.option("--scope", default=None)
 @click.option("--max-chars", type=int, default=8000)
 @click.pass_obj
-def hook_capture(data_dir: str | None, scope: str, max_chars: int) -> None:
+def hook_capture(data_dir: str | None, scope: str | None, max_chars: int) -> None:
     """Claude Code Stop hook: harvest memories from the conversation that
-    just ended. Runs the tail of the transcript through the full write
-    pipeline; extraction's salience gate + dedup keep it clean. No-ops
-    without a local extraction model (verbatim transcripts are not memories)."""
+    just ended. Runs the NEW tail of the transcript (since this transcript's
+    last capture) through the full write pipeline; extraction's salience
+    gate + dedup keep it clean. No-ops without a local extraction model
+    (verbatim transcripts are not memories)."""
     payload = _hook_payload()
     transcript_path = payload.get("transcript_path")
     if not transcript_path or not Path(transcript_path).exists():
         return
-    tail = _transcript_tail(transcript_path, max_chars)
+    marks = _load_marks(data_dir)
+    tail, new_mark = _transcript_tail(transcript_path, max_chars,
+                                      marks.get(transcript_path, 0))
     if len(tail) < 40:
-        return
+        return  # too little new content yet; don't advance the mark either
+    scope = scope or _project_scope(payload) or "default"
     with _open_surface(data_dir) as store:
         # Skip when no extraction model is reachable, in both library and
         # daemon mode — else raw transcript tails land verbatim as "memories".
@@ -795,6 +851,8 @@ def hook_capture(data_dir: str | None, scope: str, max_chars: int) -> None:
         saved = [f"{a.op.value}: {a.memory.text}" for a in actions if a.memory]
         store.log_event("auto-capture", hits=len(actions),
                         detail=_activity_detail(saved=saved))
+    marks[transcript_path] = new_mark
+    _save_marks(data_dir, marks)
 
 
 @hook.command("install")

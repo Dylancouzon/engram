@@ -7,11 +7,16 @@ via `engram consolidate`). Runs are unbounded: at personal-memory scale a
 full pass is fast; budgeting can return if dogfood data ever shows a run
 long enough to matter.
 
-Three passes, cheapest first:
+Four passes, cheapest first:
 - decay-prune: stale, never-recalled episodic memories fade out
   (soft-invalidate — history preserved, recall unpolluted).
 - dedup: normalized-identical valid memories collapse to the oldest
   (write-time dedup catches most; this catches imports and pre-judge rows).
+- near-dedup: same fact reworded across repeated captures (extraction is
+  non-deterministic) collapses on cosine similarity over the vectors
+  already stored in Edge — no re-embed. Same threshold write-time NOOP
+  uses (`config.noop_similarity`), just applied after the fact instead of
+  before a write.
 - episodic -> semantic: clusters of old episodes sharing a tag are
   summarized into one semantic memory by the local model (skipped without
   Ollama — an enhancer, like everywhere else).
@@ -52,8 +57,13 @@ def consolidate(
     store: MemoryStore,
     stop: threading.Event | None = None,
 ) -> dict[str, int]:
-    """One consolidation run. Returns per-pass counts."""
-    report = {"pruned": 0, "deduped": 0, "summarized": 0}
+    """One consolidation run. Returns per-pass counts, plus `examined` and
+    `too_young` so an all-zero run (typical on a young store) can be
+    explained instead of read as broken."""
+    report = {
+        "pruned": 0, "deduped": 0, "near_deduped": 0, "summarized": 0,
+        "examined": 0, "too_young": 0,
+    }
     now = now_ts()
 
     def cancelled() -> bool:
@@ -83,6 +93,12 @@ def consolidate(
                 )
             ]
             valid = [m for m in valid if m.is_valid]
+            report["examined"] += len(valid)
+            report["too_young"] += sum(
+                1 for m in valid
+                if m.type is MemoryType.EPISODIC
+                and (now - m.created_at) / 86400.0 < PRUNE_MIN_AGE_DAYS
+            )
 
             # -- decay-prune ----------------------------------------------------
             for m in valid:
@@ -125,6 +141,60 @@ def consolidate(
                 })
                 _soft_invalidate(store, shard, m, superseded_by=prior.id)
                 report["deduped"] += 1
+
+            # -- near-dedup -------------------------------------------------------
+            # Same fact reworded across repeated captures (extraction is
+            # non-deterministic) — exact-text dedup above can't catch this.
+            # Collapse on cosine over the vectors already in Edge; no re-embed.
+            candidates = [m for m in valid if m.is_valid and m.id not in protected]
+            vector_by_id = {
+                pid: (vec.get("dense") if isinstance(vec, dict) else vec)
+                for pid, vec, _payload in backend.export_raw()
+            }
+            ids = [m.id for m in candidates if vector_by_id.get(m.id) is not None]
+            if len(ids) >= 2 and not cancelled():
+                import numpy as np
+
+                by_id = {m.id: m for m in candidates}
+                # ponytail: O(n^2) cosine matrix over one shard's valid memories
+                # per run. Fine at personal-store scale (hundreds of memories);
+                # sample/ANN if a store ever reaches tens of thousands.
+                X = np.array([vector_by_id[i] for i in ids], dtype=np.float64)
+                norms = np.linalg.norm(X, axis=1, keepdims=True)
+                unit = X / np.where(norms == 0, 1.0, norms)
+                sim = unit @ unit.T
+                threshold = store.config.noop_similarity
+
+                parent = {i: i for i in ids}
+                for a in range(len(ids)):
+                    ma = by_id[ids[a]]
+                    for b in range(a + 1, len(ids)):
+                        mb = by_id[ids[b]]
+                        if (ma.scope == mb.scope and ma.type == mb.type
+                                and sim[a, b] >= threshold):
+                            ra, rb = _find(parent, ids[a]), _find(parent, ids[b])
+                            if ra != rb:
+                                parent[ra] = rb
+
+                clusters: dict[str, list[Memory]] = defaultdict(list)
+                for i in ids:
+                    clusters[_find(parent, i)].append(by_id[i])
+                for cluster in clusters.values():
+                    if cancelled():
+                        break
+                    if len(cluster) < 2:
+                        continue
+                    cluster.sort(key=lambda m: m.created_at)
+                    survivor, *dupes = cluster
+                    for dup in dupes:
+                        survivor.importance = max(survivor.importance, dup.importance)
+                        survivor.access_count += dup.access_count
+                        store._commit_payload(survivor, shard, {
+                            "importance": survivor.importance,
+                            "access_count": survivor.access_count,
+                        })
+                        _soft_invalidate(store, shard, dup, superseded_by=survivor.id)
+                        report["near_deduped"] += 1
 
             # -- gather episodic->semantic groups (model calls come in phase 2) --
             if can_summarize:
@@ -207,6 +277,15 @@ def consolidate(
         # run should resume at the next idle window instead.
         store.journal.set_meta("consolidated_at", str(now))
     return report
+
+
+def _find(parent: dict[str, str], x: str) -> str:
+    """Union-find with path compression, so a chain of near-duplicates
+    (A~B~C) collapses to one cluster instead of pairwise merges."""
+    while parent[x] != x:
+        parent[x] = parent[parent[x]]
+        x = parent[x]
+    return x
 
 
 def last_run(store: MemoryStore) -> float:

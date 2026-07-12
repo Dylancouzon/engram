@@ -173,6 +173,13 @@ git pull
 uv sync
 ```
 
+If you installed the CLI as a tool (`uv tool install .`), the daemon and hooks
+run that installed copy, not the repo — refresh it too:
+
+```bash
+uv tool install --force --reinstall .
+```
+
 The daemon doesn't hot-reload code — if one is already running, restart it:
 
 ```bash

@@ -707,9 +707,15 @@ $("#addbtn").onclick = async () => {
 };
 $("#dream").onclick = async () => {
   const b = $("#dream"); b.disabled = true; b.textContent = "Dreaming… (writes pause)";
-  try { const r = await api("/api/consolidate", {});
-    toast(`dreamed: ${r.pruned} pruned, ${r.deduped} deduped, ${r.summarized} summarized`); await load(); }
-  finally { b.disabled = false; b.textContent = "Dream"; }
+  try {
+    const r = await api("/api/consolidate", {});
+    const acted = r.pruned || r.deduped || r.near_deduped || r.summarized;
+    const msg = acted
+      ? `dreamed: ${r.pruned} pruned, ${r.deduped} deduped, ${r.near_deduped} near-deduped, ${r.summarized} summarized`
+      : `nothing to consolidate: ${r.examined} memories, ${r.too_young} too young to prune/summarize, no duplicates found`;
+    toast(msg);
+    await load();
+  } finally { b.disabled = false; b.textContent = "Dream"; }
 };
 
 // map highlight box

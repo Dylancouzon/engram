@@ -141,6 +141,35 @@ holds the write lock through summarization" comment corrected. **Left as-is
 (Dylan's call):** `snapshot` still omits `sync.key`/`sync.json`, so restoring
 onto a fresh device needs the key re-copied by hand.
 
+A dogfood relevance pass (July 2026, driven by Dylan's real-use complaints,
+tested against the live store) fixed the two biggest quality gaps. Measured
+first: 27% of hook-injected memories were low-value or wrong-project (all
+captures landed in scope `default`, recall never filtered), and 32% of the
+store was near-duplicates (every Stop/PreCompact re-extracted the same
+transcript tail with fresh wording; lukewarm judge verdicts degraded each to
+ADD). Fixes (**159 tests**): hooks derive `project:<cwd-dirname-lowercased>`
+— capture stores there, recall filters to `[project:x, "default"]`, explicit
+`--scope` wins (no protocol change needed: `build_filter` already MatchAny's
+a list scope); `hook capture` keeps a per-transcript high-water mark
+(`capture-marks.json` in the data dir, hook-side, advances only after
+`remember` succeeds) so only new transcript entries are ever extracted;
+consolidation gained a near-dedup pass (cosine ≥ `noop_similarity` over the
+vectors already in Edge, same shard+scope+type, union-find, oldest survives,
+soft-invalidate only) and reports `examined`/`too_young` so the serve Dream
+toast explains an all-zero run instead of looking broken. The live store was
+rescoped (347 of 422 memories moved to `project:*` scopes via daemon `edit`;
+one 42-memory drafter/post-scheduler group left in `default`, no matching
+repo dir) and a live Dream run collapsed 125 near-dups (one Vercel-email fact
+had 9 copies). Trap fixed in README: when the CLI is installed via `uv tool
+install`, the launchd daemon and hooks run THAT copy, not the repo —
+`git pull` alone upgrades nothing; `uv tool install --force --reinstall .`
+then restart the daemon. Follow-up (Dylan-approved): extraction classifies
+each fact `general: bool` — a durable fact about the user themselves routes
+to scope `default` even when captured under a `project:*` scope (including
+its conflict judging); unsure defaults to false and explicit non-project
+scopes are never overridden, because wrongly-generalized follows the user
+everywhere while wrongly-project-scoped is merely less visible.
+
 Not built (deliberate cuts, not omissions): Wave-C/D ingestion adapters
 (email/messages/voice/CLIP) — the adapter *contract* is documented in
 `docs/ingestion.md` and the write path is proven, so these are per-source
@@ -435,6 +464,12 @@ model downloads; sync tests use `QdrantClient(":memory:")` as the relay.
   being AUTOINCREMENT (no reuse) so the replacement stays above what it
   replaced; don't drop AUTOINCREMENT. `stats` reports `row_count`, not
   `last_seq` (which keeps climbing past deleted rows).
+- **The live daemon/hooks may not run repo code.** Dylan's install is `uv
+  tool install` + launchd: `~/.local/bin/engram` is a frozen copy, launchd
+  respawns it after a pkill, and `ps` shows which binary is live. Verify a
+  change against the real store only after `uv tool install --force
+  --reinstall .` + daemon restart — `uv run engram` from the repo talks to
+  the OLD daemon otherwise.
 - **Test secret fixtures** must be runtime-assembled from fragments, or
   GitGuardian flags them (it did, on commit ff5790d — those are false
   positives; assembly since 71fd366).
