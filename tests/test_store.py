@@ -19,6 +19,39 @@ def test_scope_prefilter(store):
     assert store.recall("cat named", scope="work") == []
 
 
+def test_general_fact_routes_out_of_project_scope(config):
+    # A fact about the user follows them into every repo; a project-specific
+    # sibling from the same input stays put.
+    llm = FakeLLM(extract_response={"memories": [
+        {"text": "Dylan prefers concise READMEs", "general": True},
+        {"text": "This repo's CI uses GitHub Actions", "general": False},
+    ]})
+    store = make_store(config, llm=llm)
+    try:
+        [general, project] = store.remember(
+            "Dylan prefers concise READMEs. This repo's CI uses GitHub Actions.",
+            scope="project:engram",
+        )
+        assert general.memory.scope == "default"
+        assert project.memory.scope == "project:engram"
+    finally:
+        store.close()
+
+
+def test_general_flag_ignored_outside_project_scope(config):
+    # The flag only demotes an inferred project scope; an explicit
+    # non-project scope is the caller's own choice.
+    llm = FakeLLM(extract_response={"memories": [
+        {"text": "Dylan prefers concise READMEs", "general": True},
+    ]})
+    store = make_store(config, llm=llm)
+    try:
+        [action] = store.remember("Dylan prefers concise READMEs", scope="work")
+        assert action.memory.scope == "work"
+    finally:
+        store.close()
+
+
 def test_recall_reinforces(store):
     store.remember("Dylan drinks oat-milk flat whites")
     first = store.recall("coffee oat milk drinks")[0]

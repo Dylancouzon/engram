@@ -44,8 +44,14 @@ Rules:
   for a clear standing preference or decision. Reserve 0.8+ for an explicit
   correction or "remember this". Minor detail -> below 0.3.
 - tags: 1-3 short lowercase topic tags.
+- general: true ONLY for a durable fact about the user themselves (a
+  preference, habit, or way of working) that would hold in any project —
+  e.g. "prefers concise READMEs", "always uses cheaper sub-agent models".
+  false for anything about the current project's code, content, infra,
+  bugs, or decisions. When unsure, false.
 
-Respond with JSON: {"memories": [{"text": ..., "type": ..., "importance": ..., "tags": [...]}]}
+Respond with JSON: {"memories": [
+{"text": ..., "type": ..., "importance": ..., "tags": [...], "general": ...}]}
 If nothing is worth remembering, respond {"memories": []}."""
 
 
@@ -56,6 +62,7 @@ class ExtractedFact:
     importance: float = 0.5
     tags: list[str] = field(default_factory=list)
     verbatim: bool = False  # raw text stored as-is: no model, or ungrounded output
+    general: bool = False  # durable fact about the user, not the current project
 
 
 def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> list[ExtractedFact]:
@@ -96,7 +103,8 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
             continue
         tags = [str(t).lower() for t in (item.get("tags") or []) if t][:3]
         facts.append(ExtractedFact(text=str(item["text"]).strip(), type=mtype,
-                                   importance=importance, tags=tags))
+                                   importance=importance, tags=tags,
+                                   general=item.get("general") is True))
 
     if not facts:
         # Honor a real "nothing salient" judgment (the model gave usable items

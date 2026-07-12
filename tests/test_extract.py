@@ -155,3 +155,23 @@ def test_non_numeric_importance_defaults():
         {"text": "Dylan likes tea", "importance": "high"}]})
     [fact] = extract("Dylan likes tea", llm)
     assert fact.importance == 0.5
+
+
+def test_missing_general_key_defaults_false():
+    llm = EnvelopeLLM({"memories": [{"text": "Dylan likes tea"}]})
+    [fact] = extract("Dylan likes tea", llm)
+    assert fact.general is False
+
+
+def test_malformed_general_value_defaults_false():
+    llm = EnvelopeLLM({"memories": [
+        {"text": "Dylan likes tea", "general": "yes"}]})
+    [fact] = extract("Dylan likes tea", llm)
+    assert fact.general is False
+
+
+def test_general_true_is_parsed():
+    llm = EnvelopeLLM({"memories": [
+        {"text": "Dylan prefers tea over coffee", "general": True}]})
+    [fact] = extract("Dylan prefers tea over coffee", llm)
+    assert fact.general is True

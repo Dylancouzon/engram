@@ -403,8 +403,13 @@ class MemoryStore:
                 if tags:
                     fact.tags = list(dict.fromkeys(fact.tags + [t.lower() for t in tags]))
 
-                verdict = self._resolve_conflict(fact, scope, shard)
-                action = self._apply(fact, verdict, source_text, scope, surface,
+                # A fact about the user, not the project, follows the user
+                # instead of staying trapped in this repo's scope. Only
+                # demotes an inferred project scope — an explicit non-project
+                # scope is the caller's deliberate choice, left alone.
+                fact_scope = "default" if fact.general and scope.startswith("project:") else scope
+                verdict = self._resolve_conflict(fact, fact_scope, shard)
+                action = self._apply(fact, verdict, source_text, fact_scope, surface,
                                      source_ref, shard)
                 action.redaction_hits = scrubbed.hits
                 actions.append(action)
