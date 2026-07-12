@@ -91,6 +91,7 @@ class Journal:
 
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._path = path
         existed = path.exists()
         # One shared connection, guarded by an internal lock: SQLite objects
         # must not be used from two threads at once, and callers (daemon
@@ -379,6 +380,24 @@ class Journal:
                     "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
                     (self._DETAIL_NEXT_KEY, str(next_slot + 1)),
                 )
+                self._append_activity_log(kind, hits, detail)
+
+    # DEV-ONLY (remove before release): mirror every detail-bearing event to an
+    # append-only activity.jsonl next to the journal so we can study offline what
+    # prompts came in, what was surfaced, and what was captured — including the
+    # older history the bounded event_details ring overwrites. Best-effort: a
+    # study log must never break a real write.
+    def _append_activity_log(self, kind: str, hits: int, detail: str) -> None:
+        try:
+            try:
+                payload = json.loads(detail)
+            except (ValueError, TypeError):
+                payload = {"detail": detail}
+            record = {"ts": time.time(), "kind": kind, "hits": hits, **payload}
+            with open(self._path.with_name("activity.jsonl"), "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
 
     def recent_events(self, limit: int = 50) -> list[tuple[str, float, int, str | None]]:
         """Newest firings first: (kind, ts, hits, detail) — feeds `engram log`."""
