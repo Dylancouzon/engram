@@ -175,3 +175,23 @@ def test_general_true_is_parsed():
         {"text": "Dylan prefers tea over coffee", "general": True}]})
     [fact] = extract("Dylan prefers tea over coffee", llm)
     assert fact.general is True
+
+
+def test_transient_state_forced_episodic():
+    # The model labels a bug report as a durable semantic fact; the guard
+    # demotes it to episodic so it decays fast and can't outlive the fix.
+    llm = EnvelopeLLM({"memories": [
+        {"text": "the reshard endpoint is broken", "type": "semantic",
+         "importance": 0.8}]})
+    [fact] = extract("the reshard endpoint is broken", llm)
+    assert fact.type is MemoryType.EPISODIC
+    assert fact.importance <= 0.4
+
+
+def test_durable_fact_not_demoted():
+    # No transient language -> the model's semantic classification stands.
+    llm = EnvelopeLLM({"memories": [
+        {"text": "Dylan prefers concise READMEs", "type": "semantic",
+         "importance": 0.7}]})
+    [fact] = extract("Dylan prefers concise READMEs", llm)
+    assert fact.type is MemoryType.SEMANTIC and fact.importance == 0.7

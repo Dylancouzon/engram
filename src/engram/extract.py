@@ -20,6 +20,20 @@ from engram.models import MemoryType
 _WORD = re.compile(r"\w{3,}")
 _REDACTION = re.compile(r"\[REDACTED:[^\]]*\]")
 
+# Transient status/breakage language: a bug or in-progress state ("X is broken",
+# "still failing", "works for now"), not a durable fact. A weak local model often
+# stores these as semantic, so they linger long after the fix. Force them to
+# episodic — the 14-day half-life decays them fast, dream decay-prunes them once
+# never recalled, and a later "X fixed" supersedes via the normal conflict judge.
+# ponytail: keyword heuristic, not intent detection; widen the vocabulary if
+# transient notes still slip through as semantic.
+_TRANSIENT = re.compile(
+    r"(?i)\b(broken|not working|doesn'?t work|does not work|failing|crashing|"
+    r"erroring|throws? an? error|hangs|stuck|currently|right now|at the moment|"
+    r"for now|not yet (?:working|fixed|done))\b"
+)
+_TRANSIENT_MAX_IMPORTANCE = 0.4  # keep transient notes out of the sticky high band
+
 
 def _content_tokens(text: str) -> set[str]:
     # Drop redaction placeholders first: their generic words ("redacted",
@@ -102,7 +116,14 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
         if importance < salience_floor:
             continue
         tags = [str(t).lower() for t in (item.get("tags") or []) if t][:3]
-        facts.append(ExtractedFact(text=str(item["text"]).strip(), type=mtype,
+        fact_text = str(item["text"]).strip()
+        # A transient/breakage note is never a durable semantic or procedural
+        # fact, whatever the model guessed — demote so it decays and can't
+        # outlive the fix.
+        if _TRANSIENT.search(fact_text):
+            mtype = MemoryType.EPISODIC
+            importance = min(importance, _TRANSIENT_MAX_IMPORTANCE)
+        facts.append(ExtractedFact(text=fact_text, type=mtype,
                                    importance=importance, tags=tags,
                                    general=item.get("general") is True))
 
