@@ -124,6 +124,26 @@ $ engram stats       # counts, disk usage, pending reviews
 The dashboard is one static HTML file in your memory folder: no server,
 nothing leaves the machine.
 
+### Study What Passed Through (dev-only)
+
+`engram log` and the ring behind it keep only the newest ~50 events. For
+offline study of the full history — every prompt seen, what it surfaced, what
+was captured — the daemon also appends each event to `~/.engram/activity.jsonl`
+(append-only, never pruned; prompts are secret-redacted, truncated to 500
+chars). Memory writes are covered separately by `engram export`.
+
+```console
+# prompts where nothing was recalled — the misses worth studying
+$ jq 'select(.kind=="prompt-recall" and (.surfaced|length)==0)' ~/.engram/activity.jsonl
+# what extraction actually kept from sessions
+$ jq 'select(.kind=="auto-capture") | .saved' ~/.engram/activity.jsonl
+# the full memory lifecycle: adds, updates, supersessions
+$ engram export
+```
+
+This is a temporary study aid (`_append_activity_log` in `journal.py`) and is
+removed before release — it is not covered by `forget --hard`.
+
 ## What Ownership Means Here
 
 - **Local by default.** No account, no telemetry; the only network paths are
