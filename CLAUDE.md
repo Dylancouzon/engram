@@ -202,6 +202,23 @@ capture now DETACHES (parent returns ~0.07s, child extracts in the
 background). Ollama put under launchd (`brew services start ollama`) so it
 survives reboots; the daemon deliberately does not supervise it.
 
+A capture-load pass followed (the detached captures still pegged the GPU on
+every substantive turn). Two levers, both shipped: (1) a per-transcript
+**debounce** (`capture_debounce_s`, default 90s) so rapid turns batch into one
+extraction instead of one 10-40s model run each — the parent gates cheaply and
+only spawns when there is new content past the window; (2) **split models**,
+after a Sonnet benchmark (`docs/model-benchmark.md`, 7 models × golden set):
+extraction sends long transcript prompts (the latency cost) so it moved to
+`qwen3:1.7b`, while the conflict judge (short fixed-size prompts) keeps
+`qwen3:4b` to protect op accuracy. Benchmarked split = 79% op / 93% recall vs
+86/97 for 4b-both, at ~2.6x faster extraction; the misses mostly fail toward
+ADD (safe). Config: `extraction_model` + new `judge_model` (set both the same
+to un-split); `store.judge_llm` is a second `LocalLLM`, and an injected llm
+(tests) is used for both roles. **Known cost of the split:** 1.7b is weaker at
+the extraction-time `general`/project scope call, so more project facts
+misroute to `default` (undermining the §1.3 confidence gate) — the report's
+scope-health signal is how to catch them.
+
 Not built (deliberate cuts, not omissions): Wave-C/D ingestion adapters
 (email/messages/voice/CLIP) — the adapter *contract* is documented in
 `docs/ingestion.md` and the write path is proven, so these are per-source
@@ -454,9 +471,11 @@ model downloads; sync tests use `QdrantClient(":memory:")` as the relay.
 
 ## Environment notes
 
-- Ollama installed via brew this session; `ollama serve` must be running and
-  `qwen3:4b` pulled for the judge/extraction/summarize paths. Without it
-  everything degrades to verbatim/ADD-only (by design).
+- Ollama runs under launchd (`brew services start ollama`, survives reboots).
+  Pull BOTH `qwen3:1.7b` (extraction default) and `qwen3:4b` (judge +
+  summarize). Extraction unreachable → verbatim/ADD-only; judge model
+  unreachable → judge degrades to ADD (both by design). No docker: engram is
+  local-first (Qdrant Edge in-process), the daemon is the only process.
 - Embedding models (~600 MB) cache in `~/.cache/engram/models` (NOT in the
   data dir — the memory folder stays small and portable).
 - Reference: `~/Documents/GitHub/edge-mission-control` has the qdrant_edge

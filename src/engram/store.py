@@ -223,9 +223,17 @@ class MemoryStore:
             self._owner_ns = cfg.owner_namespace()
             self.journal = Journal(cfg.journal_path)
             self.embedder = embedder or Embedder(cfg.models_dir)
-            self.llm = (
-                LocalLLM(cfg.ollama_url, cfg.extraction_model) if llm == "auto" else llm
-            )
+            # Split models: extraction (long transcript prompts) is the latency
+            # cost, so it runs a smaller/faster model; the conflict judge (short
+            # fixed-size prompts) keeps the stronger model to protect op accuracy
+            # — the highest-stakes call (ADD vs SUPERSEDE). An injected llm
+            # (tests/explicit) is used for both roles.
+            if llm == "auto":
+                self.llm = LocalLLM(cfg.ollama_url, cfg.extraction_model)
+                self.judge_llm = LocalLLM(cfg.ollama_url, cfg.judge_model)
+            else:
+                self.llm = llm
+                self.judge_llm = llm
             self.backends: dict[str, EdgeBackend] = {}
             # Set when a post-ack Edge apply fails mid-session: the journal has
             # rows Edge doesn't. While set, the flush mark is frozen so a later
@@ -450,7 +458,7 @@ class MemoryStore:
                 return Verdict(op=Op.NOOP, target=m, confidence=1.0,
                                target_similarity=score)
 
-        verdict = judge(fact.text, candidates, self.llm)
+        verdict = judge(fact.text, candidates, self.judge_llm)
         if verdict.target is not None:
             verdict.target_similarity = next(
                 (s for m, s in scored if m.id == verdict.target.id), 0.0

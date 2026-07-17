@@ -60,9 +60,15 @@ class Config:
     weight_recency: float = 0.25
     weight_importance: float = 0.25
 
-    # Extraction (enhancer — verbatim fallback if unreachable)
+    # Extraction (enhancer — verbatim fallback if unreachable). Split models:
+    # extraction sends long transcript prompts (the latency cost), so it runs a
+    # smaller/faster model; the conflict judge sends short fixed-size prompts, so
+    # it keeps the stronger model to protect op accuracy. Benchmarked: the split
+    # holds 79% op / 93% recall (vs 86/97 for 4b-both) at ~2.6x faster
+    # extraction — see docs/model-benchmark.md. Set both the same to un-split.
     ollama_url: str = "http://localhost:11434"
-    extraction_model: str = "qwen3:4b"
+    extraction_model: str = "qwen3:1.7b"
+    judge_model: str = "qwen3:4b"
     # Min seconds between captures of the SAME conversation. Each capture is a
     # 10-40s local-model burst; without this, every turn-end fires one. Rapid
     # turns batch — the transcript tail accumulates and is captured once per
