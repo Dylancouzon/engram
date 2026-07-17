@@ -11,6 +11,7 @@ import datetime as dt
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -971,17 +972,50 @@ def _warn_capture_degraded(data_dir: str | None, store) -> None:
     marker.touch()
 
 
+def _spawn_background_capture(data_dir: str | None, payload: dict,
+                             scope: str | None, max_chars: int) -> None:
+    """Re-run this capture DETACHED and return, so the interactive Stop hook
+    never waits on the extraction pipeline — a local model, serialized by
+    Ollama (NUM_PARALLEL=1), can take minutes and would freeze the session.
+    The child re-reads the same payload on stdin; ENGRAM_CAPTURE_BG stops it
+    re-spawning. If the spawn fails we skip capture rather than block."""
+    args = [sys.argv[0]]
+    if data_dir:
+        args += ["--data-dir", data_dir]
+    args += ["hook", "capture", "--max-chars", str(max_chars)]
+    if scope:
+        args += ["--scope", scope]
+    try:
+        proc = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+            env={**os.environ, "ENGRAM_CAPTURE_BG": "1"})
+        proc.stdin.write(json.dumps(payload).encode())
+        proc.stdin.close()
+    except OSError:
+        pass
+
+
 @hook.command("capture")
 @click.option("--scope", default=None)
 @click.option("--max-chars", type=int, default=8000)
 @click.pass_obj
 def hook_capture(data_dir: str | None, scope: str | None, max_chars: int) -> None:
     """Claude Code Stop hook: harvest memories from the conversation that
-    just ended. Runs the NEW tail of the transcript (since this transcript's
-    last capture) through the full write pipeline; extraction's salience
-    gate + dedup keep it clean. No-ops without a local extraction model
-    (verbatim transcripts are not memories)."""
+    just ended. Detaches immediately (extraction is slow background work,
+    never block the session), then in the child runs the NEW tail of the
+    transcript through the full write pipeline; extraction's salience gate +
+    dedup keep it clean. No-ops without a local extraction model."""
     payload = _hook_payload()
+    if os.environ.get("ENGRAM_CAPTURE_BG") != "1":
+        _spawn_background_capture(data_dir, payload, scope, max_chars)
+        return
+    _run_capture(data_dir, payload, scope, max_chars)
+
+
+def _run_capture(data_dir: str | None, payload: dict, scope: str | None,
+                 max_chars: int) -> None:
+    """The actual harvest, run detached in the background child."""
     transcript_path = payload.get("transcript_path")
     if not transcript_path or not Path(transcript_path).exists():
         return

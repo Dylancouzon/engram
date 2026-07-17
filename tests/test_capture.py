@@ -170,6 +170,45 @@ def test_recall_usefulness_none_without_injection(tmp_path):
     assert _recall_usefulness(_transcript(tmp_path, entries)) is None
 
 
+def test_spawn_background_capture_detaches_and_pipes_payload(monkeypatch):
+    # The Stop hook must detach: a new session (so Claude Code's hook-group
+    # signal can't kill it), the payload piped to the child's stdin, and the
+    # re-spawn guard set. This is what stops the 2-min interactive stall.
+    from engram import cli
+
+    class FakeStdin:
+        data = b""
+
+        def write(self, b):
+            self.data += b
+
+        def close(self):
+            pass
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+
+    seen = {}
+
+    def fake_popen(args, **kw):
+        seen["args"], seen["kw"] = args, kw
+        seen["proc"] = FakeProc()
+        return seen["proc"]
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    payload = {"transcript_path": "/x", "session_id": "s"}
+    cli._spawn_background_capture("/tmp/dd", payload, "project:foo", 4000)
+
+    a = seen["args"]
+    assert a[:3] == [cli.sys.argv[0], "--data-dir", "/tmp/dd"]
+    assert a[3:5] == ["hook", "capture"] and "--scope" in a and "project:foo" in a
+    assert "4000" in a
+    assert seen["kw"]["start_new_session"] is True
+    assert seen["kw"]["env"]["ENGRAM_CAPTURE_BG"] == "1"
+    assert json.loads(seen["proc"].stdin.data) == payload
+
+
 if __name__ == "__main__":
     import sys
 

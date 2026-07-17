@@ -9,12 +9,15 @@ load-bearing decision and *why*, the milestone state, the invariants you must
 not break, and the traps already discovered. Full original spec:
 `INSTRUCTIONS.md`. Verified Edge 0.7.2 API facts: `docs/edge-api-notes.md`
 (read before touching `backend/edge.py`). Ingestion-adapter contract:
-`docs/ingestion.md`.
+`docs/ingestion.md`. **Self-troubleshoot + dogfood-improvement loop:
+`docs/self-improve.md`** — the exact test/diagnose/fix/ship procedure; run
+`uv run python tools/report.py` to turn `~/.engram/activity.jsonl` into a
+health report before deciding what to improve.
 
 ## Status: M0–M3 complete
 
 All four milestones built, reviewed (Codex + andrey-review adversarial passes,
-all findings fixed), and validated with real models. **133 tests green**, ruff
+all findings fixed), and validated with real models. **177 tests green**, ruff
 clean. Golden set: **84% op accuracy, 100% recall accuracy** (misses are the
 safe direction: mostly degrade-to-ADD, plus a couple NOOP→UPDATE — never a
 wrongful supersede or a lost recall). ~4500 LOC source.
@@ -169,6 +172,35 @@ to scope `default` even when captured under a `project:*` scope (including
 its conflict judging); unsure defaults to false and explicit non-project
 scopes are never overridden, because wrongly-generalized follows the user
 everywhere while wrongly-project-scoped is merely less visible.
+
+A dogfood reliability + instrumentation pass (July 17, driven by a live
+`~/.engram` health check) fixed write-time scope/quality bugs and made the
+store self-diagnosing (**177 tests**). **Fixes:** hook recall never resolves
+scope to `None` again (a missing `cwd` fell through to *unfiltered* recall
+across every project — `_project_scope` falls back to `Path.cwd()`); the
+general/default classifier gained a confidence gate (`general_confidence`,
+reuses `judge_confidence` 0.8) so a low-confidence "general" fact stays
+project-scoped; recall recency tracks `created_at`, not `last_accessed` —
+killing a day-one rich-get-richer loop where being surfaced kept a memory
+looking fresh; MCP `recall` restricts to `[project, "default"]` by default
+(mirrors the hooks, matches `remember`), which exposed and fixed a daemon bug
+where a *list* scope hit the string-only `_check_scope` and wrongly denied
+non-`*` clients (now confined to the allowlist). **Dogfood instrumentation**
+(all into the dev-only `activity.jsonl`): recall events record surfaced ids,
+latency, best-rejected similarity, and the session scope (the §3 self-healing
+attribution — logged now, the demote/flag check deferred until data
+accumulates); `hook capture` logs a `recall-usefulness` proxy (does an
+injected memory show up in a later assistant reply — weak, under-counts,
+validated on 100 real transcripts) and a deduped `capture-degraded` event when
+no extraction model is reachable (a stopped Ollama was silently dropping
+captures for days). `tools/report.py` turns `activity.jsonl` into a compact
+health report; `docs/self-improve.md` is the exact test→diagnose→fix→ship
+runbook (pointed to from the top of this file). **Then a live bug the dogfood
+surfaced:** the Stop hook ran extraction synchronously and froze Claude Code
+~2min (Ollama `NUM_PARALLEL=1` serializes concurrent sessions' captures) —
+capture now DETACHES (parent returns ~0.07s, child extracts in the
+background). Ollama put under launchd (`brew services start ollama`) so it
+survives reboots; the daemon deliberately does not supervise it.
 
 Not built (deliberate cuts, not omissions): Wave-C/D ingestion adapters
 (email/messages/voice/CLIP) — the adapter *contract* is documented in
@@ -500,6 +532,17 @@ model downloads; sync tests use `QdrantClient(":memory:")` as the relay.
   any was forgotten, invalidated, edited, or newly protected mid-run, discard
   the whole summary — a summary built from now-forgotten text would otherwise
   re-journal that content after `forget` returned.
+- **`hook capture` must stay DETACHED.** Extraction runs a local model that
+  Ollama serializes (`NUM_PARALLEL=1`); inline in the Stop hook it froze the
+  interactive session for minutes when sessions overlapped. The hook re-spawns
+  itself in a new session with `ENGRAM_CAPTURE_BG=1`, pipes the payload to the
+  child's stdin, and returns immediately. Do NOT collapse it back to a
+  synchronous call. Capture-marks advance in the child (after the write), so a
+  child that dies just re-picks the tail next Stop — no optimistic-mark loss.
+- **The Stop hook's cost is invisible to the user but real.** Anything added to
+  the capture path (the `recall-usefulness` transcript parse, etc.) runs in the
+  detached child, off the hot path — keep it there. The full-transcript parse
+  is ~0.36s even on a 66 MB transcript, so it is fine in the child, NOT inline.
 
 ## Working rules for this repo
 
