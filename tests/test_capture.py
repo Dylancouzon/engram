@@ -9,11 +9,15 @@ new turns must extract only the delta."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from engram.cli import (
+    _activity_detail,
+    _best_rejected,
     _hook_recall_scope,
     _load_marks,
     _project_scope,
+    _recall_usefulness,
     _save_marks,
     _transcript_tail,
 )
@@ -102,14 +106,68 @@ def test_marks_missing_or_corrupt_file_degrades_to_empty(tmp_path):
 
 def test_project_scope_derived_from_payload_cwd():
     assert _project_scope({"cwd": "/Users/dylan/Projects/Engram"}) == "project:engram"
-    assert _project_scope({}) is None
+    # Missing cwd falls back to the process cwd — never None, or the scope
+    # filter would silently disable and recall across every project.
+    assert _project_scope({}) == f"project:{Path.cwd().name.lower()}"
 
 
 def test_hook_recall_scope_prefers_explicit_then_falls_back_to_project_and_default():
     payload = {"cwd": "/Users/dylan/Projects/Engram"}
     assert _hook_recall_scope("work", payload) == "work"           # explicit wins
     assert _hook_recall_scope(None, payload) == ["project:engram", "default"]
-    assert _hook_recall_scope(None, {}) is None                    # no cwd, no filter
+    # No cwd: falls back to a real project scope, never None (no unfiltered recall).
+    assert _hook_recall_scope(None, {}) == [f"project:{Path.cwd().name.lower()}", "default"]
+
+
+def test_activity_detail_records_study_fields():
+    # scope = §3 self-healing attribution; ids/latency/best_rejected feed the
+    # offline dogfood report. All omitted when absent (kept small).
+    detail = json.loads(_activity_detail(
+        surfaced=["x"], ids=["abc"], scope=["project:engram", "default"],
+        latency_ms=12.3, best_rejected=0.42))
+    assert detail["scope"] == ["project:engram", "default"]
+    assert detail["ids"] == ["abc"]
+    assert detail["latency_ms"] == 12.3
+    assert detail["best_rejected"] == 0.42
+    bare = json.loads(_activity_detail(surfaced=["x"]))
+    assert not ({"scope", "ids", "latency_ms", "best_rejected"} & bare.keys())
+
+
+class _Hit:
+    def __init__(self, similarity):
+        self.similarity = similarity
+
+
+def test_best_rejected_is_top_uninjected_similarity():
+    raw = [_Hit(0.9), _Hit(0.42), _Hit(0.3)]
+    assert _best_rejected(raw, raw[:1]) == 0.42       # best of the two not injected
+    assert _best_rejected(raw, raw) is None            # everything made the cut
+
+
+def _transcript(tmp_path, entries):
+    p = tmp_path / "t.jsonl"
+    p.write_text("\n".join(json.dumps(e) for e in entries))
+    return str(p)
+
+
+def test_recall_usefulness_matches_injected_to_replies(tmp_path):
+    entries = [
+        {"attachment": {"content": "<engram-memories>\n"
+                        "- Dylan prefers oat-milk lattes every single morning\n"
+                        "- The deployment pipeline uses github actions workflow scripts"}},
+        {"message": {"role": "assistant", "content":
+                     "I'll note that you prefers oat-milk lattes every single morning."}},
+    ]
+    u = _recall_usefulness(_transcript(tmp_path, entries))
+    assert u["injected"] == 2
+    assert u["used"] == 1
+    assert any("oat-milk" in t for t in u["used_texts"])
+    assert any("deployment pipeline" in t for t in u["unused_texts"])
+
+
+def test_recall_usefulness_none_without_injection(tmp_path):
+    entries = [{"message": {"role": "assistant", "content": "no memories here"}}]
+    assert _recall_usefulness(_transcript(tmp_path, entries)) is None
 
 
 if __name__ == "__main__":

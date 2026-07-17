@@ -20,10 +20,11 @@ def test_scope_prefilter(store):
 
 
 def test_general_fact_routes_out_of_project_scope(config):
-    # A fact about the user follows them into every repo; a project-specific
-    # sibling from the same input stays put.
+    # A fact about the user follows them into every repo, but only when the
+    # classifier is confident; a project-specific sibling stays put.
     llm = FakeLLM(extract_response={"memories": [
-        {"text": "Dylan prefers concise READMEs", "general": True},
+        {"text": "Dylan prefers concise READMEs", "general": True,
+         "general_confidence": 0.9},
         {"text": "This repo's CI uses GitHub Actions", "general": False},
     ]})
     store = make_store(config, llm=llm)
@@ -34,6 +35,23 @@ def test_general_fact_routes_out_of_project_scope(config):
         )
         assert general.memory.scope == "default"
         assert project.memory.scope == "project:engram"
+    finally:
+        store.close()
+
+
+def test_low_confidence_general_stays_in_project_scope(config):
+    # general=True but below the confidence gate: keep the project scope. A
+    # wrongly-generalized fact follows the user everywhere, so escaping the
+    # project scope requires the same confidence bar as the conflict judge.
+    llm = FakeLLM(extract_response={"memories": [
+        {"text": "Walt prefers jeans over flannels", "general": True,
+         "general_confidence": 0.5},
+    ]})
+    store = make_store(config, llm=llm)
+    try:
+        [action] = store.remember("Walt prefers jeans over flannels",
+                                  scope="project:ecommerce-demo")
+        assert action.memory.scope == "project:ecommerce-demo"
     finally:
         store.close()
 

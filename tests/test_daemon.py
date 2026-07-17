@@ -85,6 +85,14 @@ def test_scope_allowlist_enforced(config, daemon):
         texts = [h.memory.text for h in c.recall("cat Miso deploy actions", k=10)]
         assert any("GitHub Actions" in t for t in texts)
         assert all("Miso" not in t for t in texts)
+        # A requested list scope (the hooks'/MCP's [project, default] shape) is
+        # confined to the overlap, not denied outright. Asking only for scopes
+        # it can't read returns nothing.
+        texts = [h.memory.text for h in
+                 c.recall("cat Miso deploy actions", scope=["work", "personal"], k=10)]
+        assert any("GitHub Actions" in t for t in texts)
+        assert all("Miso" not in t for t in texts)
+        assert c.recall("cat Miso", scope=["personal"], k=10) == []
         # Forgetting a memory in a denied scope is refused too.
         with _client(config, "cli") as owner:
             personal_id = owner.recall("cat Miso")[0].memory.id

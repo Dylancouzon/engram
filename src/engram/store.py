@@ -406,8 +406,14 @@ class MemoryStore:
                 # A fact about the user, not the project, follows the user
                 # instead of staying trapped in this repo's scope. Only
                 # demotes an inferred project scope — an explicit non-project
-                # scope is the caller's deliberate choice, left alone.
-                fact_scope = "default" if fact.general and scope.startswith("project:") else scope
+                # scope is the caller's deliberate choice, left alone. Gated on
+                # confidence (same bar as the conflict judge): a wrongly-
+                # generalized fact follows the user everywhere, so escape the
+                # project scope only when the model is sure.
+                generalize = (fact.general
+                              and fact.general_confidence >= self.config.judge_confidence
+                              and scope.startswith("project:"))
+                fact_scope = "default" if generalize else scope
                 verdict = self._resolve_conflict(fact, fact_scope, shard)
                 action = self._apply(fact, verdict, source_text, fact_scope, surface,
                                      source_ref, shard)
@@ -635,7 +641,12 @@ class MemoryStore:
         rescored: list[RecallHit] = []
         for h in hits:
             m = h.memory()
-            age_days = max(0.0, now - (m.last_accessed or m.created_at)) / 86400.0
+            # Recency = how old the FACT is (created_at, which advances on every
+            # content edit/supersede), NOT how recently it was surfaced. Using
+            # last_accessed made being shown refresh the recency clock, so the
+            # first memory surfaced kept winning and entrenching itself —
+            # a rich-get-richer loop independent of whether the hit was useful.
+            age_days = max(0.0, now - m.created_at) / 86400.0
             half_life = self.config.half_life_days.get(m.type.value, 90.0)
             recency = math.exp(-math.log(2) * age_days / half_life)
             w_rec, w_imp = self.config.weight_recency, self.config.weight_importance

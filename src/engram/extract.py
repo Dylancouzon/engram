@@ -63,9 +63,12 @@ Rules:
   e.g. "prefers concise READMEs", "always uses cheaper sub-agent models".
   false for anything about the current project's code, content, infra,
   bugs, or decisions. When unsure, false.
+- general_confidence: 0.0-1.0 that `general` is right. A fact only escapes
+  the current project's scope at high confidence, so if you are unsure
+  whether it is truly project-independent, lower this or set general false.
 
-Respond with JSON: {"memories": [
-{"text": ..., "type": ..., "importance": ..., "tags": [...], "general": ...}]}
+Respond with JSON: {"memories": [{"text": ..., "type": ..., "importance": ...,
+"tags": [...], "general": ..., "general_confidence": ...}]}
 If nothing is worth remembering, respond {"memories": []}."""
 
 
@@ -77,6 +80,7 @@ class ExtractedFact:
     tags: list[str] = field(default_factory=list)
     verbatim: bool = False  # raw text stored as-is: no model, or ungrounded output
     general: bool = False  # durable fact about the user, not the current project
+    general_confidence: float = 0.0  # model's confidence in `general`; gates the scope escape
 
 
 def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> list[ExtractedFact]:
@@ -129,9 +133,11 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
         if _TRANSIENT.search(fact_text):
             mtype = MemoryType.EPISODIC
             importance = min(importance, _TRANSIENT_MAX_IMPORTANCE)
+        gen_conf = clamp01(item.get("general_confidence") or 0.0, 0.0)
         facts.append(ExtractedFact(text=fact_text, type=mtype,
                                    importance=importance, tags=tags,
-                                   general=item.get("general") is True))
+                                   general=item.get("general") is True,
+                                   general_confidence=gen_conf))
 
     # Raw input was transient but the extractor washed the wording out of the
     # one fact it produced — demote that fact too. Only for a clean 1:1 mapping.

@@ -229,11 +229,17 @@ class Daemon:
         if not scopes:
             raise ProtocolError(E_SCOPE_DENIED, "client has an empty scope allowlist")
         scope = params.get("scope")
-        if scope:
-            _check_scope(scopes, scope)
-        elif "*" not in scopes:
-            # No scope requested: the client sees only what it's allowed.
-            scope = scopes  # build_filter accepts a list
+        if "*" not in scopes:
+            if isinstance(scope, list):
+                # A requested allowlist (e.g. the hooks' / MCP's [project, default])
+                # is confined to what this client may see — an empty overlap means
+                # it asked only for scopes it can't read, so it sees nothing.
+                scope = [s for s in scope if s in scopes]
+            elif scope:
+                _check_scope(scopes, scope)
+            else:
+                # No scope requested: the client sees only what it's allowed.
+                scope = scopes  # build_filter accepts a list
         mtype = params.get("type")
         hits = self.store.recall(
             query=str(params["query"]),

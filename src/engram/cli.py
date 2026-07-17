@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -654,38 +655,74 @@ def hook() -> None:
     """Proactive recall triggers for assistant surfaces."""
 
 
-def _project_scope(payload: dict) -> str | None:
-    """project:<dirname>, derived from the hook payload's cwd — memories
-    captured in one project don't recall into an unrelated one. None
-    outside a known cwd."""
-    cwd = payload.get("cwd")
-    return f"project:{Path(cwd).name.lower()}" if cwd else None
+def _project_scope(payload: dict) -> str:
+    """project:<dirname>, derived from the hook payload's cwd, falling back
+    to the process cwd — a missing cwd must NEVER disable scope filtering
+    (build_filter treats scope=None as "no filter", so that would recall
+    across every project). Both hooks route through here."""
+    cwd = payload.get("cwd") or Path.cwd()
+    return f"project:{Path(cwd).name.lower()}"
 
 
-def _hook_recall_scope(scope: str | None, payload: dict) -> str | list[str] | None:
+def _hook_recall_scope(scope: str | None, payload: dict) -> str | list[str]:
     """An explicit --scope always wins. Otherwise recall the current
     project plus "default" (pre-scoping capture data), so another
-    project's memories don't crowd this one out."""
+    project's memories don't crowd this one out. Never None: an unfiltered
+    hook recall is the scope-leak bug this exists to prevent."""
     if scope is not None:
         return scope
-    project = _project_scope(payload)
-    return [project, "default"] if project else None
+    return [_project_scope(payload), "default"]
 
 
 def _activity_detail(prompt: str | None = None, surfaced: list[str] | None = None,
-                     saved: list[str] | None = None) -> str:
-    """A small JSON snippet for the serve activity view. The prompt is scrubbed
-    (raw user input never lands, even in this read-only log); memory texts are
-    already-redacted stored content. Bounded so the events table stays small."""
+                     saved: list[str] | None = None,
+                     scope: str | list[str] | None = None,
+                     ids: list[str] | None = None,
+                     latency_ms: float | None = None,
+                     best_rejected: float | None = None) -> str:
+    """A small JSON snippet for the serve activity view and the dev-only
+    activity.jsonl study log. The prompt is scrubbed (raw user input never
+    lands, even in this read-only log); memory texts are already-redacted
+    stored content. Bounded so the events ring stays small.
+
+    Study fields (feed the offline dogfood report, not the serve UI):
+    - scope: which project the recall ran in — spots a "default" memory only
+      ever surfaced in one project (the §3 self-healing signal, deferred).
+    - ids: the surfaced memory ids, so the report counts per-memory EXACTLY
+      instead of string-matching truncated text.
+    - latency_ms: recall wall-time — proactive recall blocks generation on
+      UserPromptSubmit, so a slow hook is a real dogfood pain the report can
+      otherwise never see.
+    - best_rejected: highest raw similarity of a candidate we did NOT inject —
+      a false-negative / gate-tuning signal (a memory that keeps almost-
+      surfacing)."""
     from engram.redact import redact
     d: dict = {}
     if prompt:
         d["prompt"] = redact(prompt).text[:500]
     if surfaced:
         d["surfaced"] = [t[:200] for t in surfaced[:8]]
+    if ids:
+        d["ids"] = ids[:8]
     if saved:
         d["saved"] = [t[:200] for t in saved[:8]]
+    if scope is not None:
+        d["scope"] = scope
+    if latency_ms is not None:
+        d["latency_ms"] = latency_ms
+    if best_rejected is not None:
+        d["best_rejected"] = best_rejected
     return json.dumps(d, ensure_ascii=False)
+
+
+def _best_rejected(raw: list, hits: list) -> float | None:
+    """Highest raw similarity among recalled candidates that were NOT injected
+    (fell below the noise gate, or got crowded past the top-k cap). A study
+    signal for false negatives: a memory that repeatedly almost-surfaces is a
+    gate/scope tuning lead. None when every candidate made the cut."""
+    injected = {id(h) for h in hits}
+    scores = [h.similarity for h in raw if id(h) not in injected]
+    return round(max(scores), 4) if scores else None
 
 
 @hook.command("session-start")
@@ -710,10 +747,16 @@ def hook_session_start(data_dir: str | None, scope: str | None, k: int,
         # on-topic hit isn't crowded out of the top-k by the recency/importance
         # rescore before it's even scored. Without the gate an unrelated repo
         # gets k random nearest neighbours injected every session start.
+        t0 = time.perf_counter()
         raw = store.recall(query, k=k * 3, scope=recall_scope, reinforce=False)
+        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
         hits = [h for h in raw if h.similarity >= min_score][:k]
         store.log_event("session-start-recall", hits=len(hits),
-                        detail=_activity_detail(surfaced=[h.memory.text for h in hits]))
+                        detail=_activity_detail(
+                            surfaced=[h.memory.text for h in hits],
+                            ids=[h.memory.id for h in hits],
+                            scope=recall_scope, latency_ms=latency_ms,
+                            best_rejected=_best_rejected(raw, hits)))
         pending = len(store.pending_reviews())
     if hits:
         click.echo(f"## Relevant long-term memories (engram, project {cwd.name})")
@@ -747,11 +790,16 @@ def hook_user_prompt(data_dir: str | None, scope: str | None, k: int,
         # Over-fetch, gate on RAW similarity, then cap: filtering the already
         # top-k-by-blended-score list would let a fresh-but-off-topic memory
         # crowd out an on-topic one before the gate ever sees it.
+        t0 = time.perf_counter()
         raw = store.recall(prompt, k=k * 3, scope=recall_scope, reinforce=False)
+        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
         hits = [h for h in raw if h.similarity >= min_score][:k]
         store.log_event("prompt-recall", hits=len(hits),
                         detail=_activity_detail(prompt=prompt,
-                                                surfaced=[h.memory.text for h in hits]))
+                                                surfaced=[h.memory.text for h in hits],
+                                                ids=[h.memory.id for h in hits],
+                                                scope=recall_scope, latency_ms=latency_ms,
+                                                best_rejected=_best_rejected(raw, hits)))
     if not hits:
         return
     click.echo("<engram-memories>")
@@ -820,6 +868,109 @@ def _save_marks(data_dir: str | None, marks: dict[str, int]) -> None:
     os.replace(tmp, path)
 
 
+# DEV-ONLY recall-usefulness proxy (remove with activity.jsonl before release).
+# engram's hooks inject memories as a block that Claude Code stores as an
+# 'attachment' transcript entry (attachment.content). UserPromptSubmit emits
+# <engram-memories>; SessionStart emits the "Relevant long-term memories"
+# heading. We find those blocks, then ask whether each injected memory's
+# distinctive words later show up in an assistant reply.
+_INJECT_MARKERS = ("<engram-memories>", "Relevant long-term memories")
+_BULLET = re.compile(r"^- (.+)$", re.M)
+_WORD_LONG = re.compile(r"\w{5,}")  # distinctive words; skips short/common tokens
+_USED_OVERLAP = 0.5  # fraction of a memory's distinctive words a reply must echo
+
+
+def _entry_text(content) -> str:
+    """Plain text of a transcript message: a bare string, or the text blocks
+    of a content list."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _recall_usefulness(transcript_path: str) -> dict | None:
+    """DEV-ONLY study signal (remove with activity.jsonl before release). Of the
+    memories engram injected into this session, how many later showed up in an
+    assistant reply — a weak proxy for "did the recall get used". Self-contained
+    from the transcript: injected bullets come from engram's 'attachment'
+    entries, replies are the assistant turns that follow. Returns
+    {injected, judged, used, used_texts, unused_texts} or None when engram
+    injected nothing this session (so only real recall sessions are logged).
+    ponytail: token-overlap heuristic, not causal attribution (overlap != use,
+    and morphology makes it UNDER-count, the safe direction) — replace with an
+    explicit signal only if the proxy proves too noisy to act on."""
+    try:
+        lines = Path(transcript_path).read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    injected: list[str] = []   # injected memory bullets, in transcript order
+    used: set[int] = set()     # indices whose distinctive words later appeared in a reply
+    pending: list[int] = []    # injected indices not yet matched to a reply
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        att = entry.get("attachment")
+        if isinstance(att, dict):
+            content = att.get("content") or att.get("stdout") or ""
+            if isinstance(content, str) and any(m in content for m in _INJECT_MARKERS):
+                for text in _BULLET.findall(content):
+                    pending.append(len(injected))
+                    injected.append(text.strip())
+                continue
+        message = entry.get("message") or {}
+        if message.get("role") != "assistant" or not pending:
+            continue
+        reply_tokens = set(_WORD_LONG.findall(_entry_text(message.get("content")).lower()))
+        if not reply_tokens:
+            continue
+        still_pending = []
+        for idx in pending:
+            toks = set(_WORD_LONG.findall(injected[idx].lower()))
+            if len(toks) >= 3 and len(toks & reply_tokens) / len(toks) >= _USED_OVERLAP:
+                used.add(idx)
+            else:
+                still_pending.append(idx)
+        pending = still_pending
+    if not injected:
+        return None
+    # A memory needs enough distinctive words to judge overlap at all; ones
+    # below that are counted in `injected` but excluded from the used/judged rate.
+    judgeable = [i for i, t in enumerate(injected)
+                 if len(set(_WORD_LONG.findall(t.lower()))) >= 3]
+    return {
+        "injected": len(injected),
+        "judged": len(judgeable),
+        "used": len(used),
+        "used_texts": [injected[i][:200] for i in sorted(used)][:8],
+        "unused_texts": [injected[i][:200] for i in judgeable if i not in used][:8],
+    }
+
+
+_DEGRADE_WARN_FILE = "capture-degraded.warn"
+_DEGRADE_WARN_WINDOW = 6 * 3600  # Stop fires per conversation; re-warn at most every 6h
+
+
+def _warn_capture_degraded(data_dir: str | None, store) -> None:
+    """Record a `capture-degraded` event when extraction has no model to run,
+    so a missing/stopped Ollama shows up in `engram log` instead of the store
+    silently ceasing to grow. Deduped via a marker file's mtime — an unguarded
+    event on every Stop would flood the (unbounded) events table."""
+    marker = _config(data_dir).data_dir / _DEGRADE_WARN_FILE
+    try:
+        if dt.datetime.now().timestamp() - marker.stat().st_mtime < _DEGRADE_WARN_WINDOW:
+            return
+    except OSError:
+        pass  # missing marker -> warn now
+    store.log_event("capture-degraded",
+                    detail=json.dumps({"reason": "no extraction model reachable (Ollama down?)"}))
+    marker.touch()
+
+
 @hook.command("capture")
 @click.option("--scope", default=None)
 @click.option("--max-chars", type=int, default=8000)
@@ -839,12 +990,22 @@ def hook_capture(data_dir: str | None, scope: str | None, max_chars: int) -> Non
                                       marks.get(transcript_path, 0))
     if len(tail) < 40:
         return  # too little new content yet; don't advance the mark either
-    scope = scope or _project_scope(payload) or "default"
+    scope = scope or _project_scope(payload)
     with _open_surface(data_dir) as store:
+        # DEV-ONLY: log the recall-usefulness proxy for this session before the
+        # model gate — it reads only the transcript, so it works even when
+        # extraction is degraded. One row per Stop that had injections; the
+        # report dedups by session_id (later Stops recompute cumulatively).
+        usefulness = _recall_usefulness(transcript_path)
+        if usefulness:
+            store.log_event("recall-usefulness", hits=usefulness["used"],
+                            detail=json.dumps({"session_id": payload.get("session_id"),
+                                               **usefulness}, ensure_ascii=False))
         # Skip when no extraction model is reachable, in both library and
         # daemon mode — else raw transcript tails land verbatim as "memories".
         # stats()["extraction"] proxies through the daemon, so it's symmetric.
         if store.stats().get("extraction") != "ollama":
+            _warn_capture_degraded(data_dir, store)
             return
         actions = store.remember(tail, scope=scope, surface="auto-capture",
                                  source_ref=str(transcript_path))

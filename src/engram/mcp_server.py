@@ -101,6 +101,15 @@ def run_mcp(config: Config, client_name: str, token: str | None = None) -> None:
         check what is already known about the people, projects, tools, or
         preferences involved. Returns the most relevant memories, weighted
         by recency and importance. Query with natural language."""
+        # Restrict to this project + "default" when the caller gives no scope,
+        # mirroring the hooks and matching remember's "default" — an unscoped
+        # recall must not fan out across every project. The server runs as a
+        # subprocess of the client in the project dir, so its cwd IS the
+        # project. Same contract as cli._project_scope. Pass an explicit scope
+        # to search broadly.
+        if scope is None:
+            from pathlib import Path
+            scope = [f"project:{Path.cwd().name.lower()}", "default"]
         try:
             hits = call(client.recall, query, k=k, scope=scope, retry=True)
         except DaemonUnavailable:
