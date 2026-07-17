@@ -30,6 +30,8 @@ from __future__ import annotations
 import hmac
 import json
 import secrets
+import urllib.error
+import urllib.request
 import webbrowser
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -170,6 +172,10 @@ class _BaseHandler(BaseHTTPRequestHandler):
                 return self._json({"error": f"daemon unavailable: {e}"}, 503)
             except ProtocolError as e:
                 return self._json({"error": e.code + ": " + str(e)}, 400)
+        if path == "/api/ollama":
+            if not self._api_authed():
+                return self._deny(403, "unauthorized")
+            return self._json(self._ollama_ps())
         return self._deny(404, "not found")
 
     def do_POST(self):
@@ -217,6 +223,29 @@ class _BaseHandler(BaseHTTPRequestHandler):
             reviews = [review_to_wire(r) for r in c.pending_reviews()]
         self._json({"memories": memories, "points": points, "events": events,
                     "stats": stats, "reviews": reviews})
+
+    def _ollama_ps(self):
+        """What Ollama is holding in memory right now — the live 'what is the
+        GPU doing' view. `/api/ps` lists loaded models (residency, not per-token
+        activity: Ollama has no stable active-request endpoint), which is enough
+        to tell which engram task is running — extraction (small model) vs
+        judge/dream (large model)."""
+        cfg = self.config
+        role = {cfg.extraction_model: "extraction", cfg.judge_model: "judge / dream"}
+        try:
+            req = urllib.request.Request(cfg.ollama_url.rstrip("/") + "/api/ps")
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                data = json.loads(resp.read())
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            return {"error": "ollama unreachable"}
+        models = [
+            {"name": m.get("name", "?"),
+             "role": role.get(m.get("name", ""), "other"),
+             "vram_mb": round((m.get("size_vram") or 0) / 1_048_576),
+             "expires_at": m.get("expires_at")}
+            for m in data.get("models", [])
+        ]
+        return {"models": models}
 
     def _remember(self):
         b = self._read_json()
@@ -347,6 +376,8 @@ header h1 { font-size: 1.05rem; font-weight: 680; letter-spacing: -0.01em; }
 header h1 .dot { color: var(--accent); }
 .stat { font-size: 0.76rem; color: var(--ink-3); }
 .stat b { color: var(--ink); font-variant-numeric: tabular-nums; }
+#gpu.live { color: var(--accent); }
+#gpu.live b { color: var(--accent); }
 .grow { flex: 1; }
 button.act { background: var(--surface-2); color: var(--ink); border: 1px solid var(--line);
   border-radius: 7px; padding: 0.35rem 0.7rem; font: inherit; font-size: 0.82rem; cursor: pointer; }
@@ -452,6 +483,7 @@ textarea#add { width: 100%; min-height: 3.4rem; resize: vertical; background: va
     <h1>engram<span class="dot">.</span></h1>
     <span class="stat" id="hstat">loading…</span>
     <span class="grow"></span>
+    <span class="stat" id="gpu" title="What Ollama is holding in GPU memory right now (extraction = small model, judge/dream = large model)">GPU: —</span>
     <button class="act" id="dream" title="Consolidate memories now — prune, dedupe, summarize (like dreaming)">Dream</button>
   </header>
   <div class="stage">
@@ -765,6 +797,21 @@ async function sendChat() {
 }
 $("#chatsend").onclick = sendChat;
 $("#chatin").addEventListener("keydown", e => { if (e.key === "Enter") sendChat(); });
+
+// live GPU / Ollama activity — polled independently of the (heavy) state load
+async function pollGpu() {
+  const el = $("#gpu");
+  try {
+    const r = await fetch("/api/ollama", { headers: { "X-Engram-Token": TOKEN } });
+    const o = await r.json();
+    if (o.error) { el.textContent = "GPU: ollama offline"; el.classList.remove("live"); return; }
+    if (!o.models || !o.models.length) { el.textContent = "GPU: idle"; el.classList.remove("live"); return; }
+    el.innerHTML = "GPU: " + o.models.map(m =>
+      `<b>${esc(m.role)}</b> (${esc(m.name)}, ${m.vram_mb} MB)`).join(" · ");
+    el.classList.add("live");
+  } catch (e) { el.textContent = "GPU: —"; el.classList.remove("live"); }
+}
+pollGpu(); setInterval(pollGpu, 2000);
 
 load();
 </script>
