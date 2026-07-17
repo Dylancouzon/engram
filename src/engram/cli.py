@@ -961,10 +961,11 @@ def _capture_debounced(data_dir: str | None, transcript_path: str) -> bool:
     a 10-40s model run each. The tail keeps accumulating (marks only advance on
     a real capture), so nothing is lost. Records `now` when it lets a capture
     through, so a slow capture can't be re-spawned on its heels."""
-    window = _config(data_dir).capture_debounce_s
+    cfg = _config(data_dir)
+    window = cfg.capture_debounce_s
     if window <= 0:
         return False
-    path = _config(data_dir).data_dir / _DEBOUNCE_FILE
+    path = cfg.data_dir / _DEBOUNCE_FILE
     try:
         stamps = json.loads(path.read_text())
     except (OSError, ValueError):

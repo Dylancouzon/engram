@@ -558,10 +558,14 @@ model downloads; sync tests use `QdrantClient(":memory:")` as the relay.
   child's stdin, and returns immediately. Do NOT collapse it back to a
   synchronous call. Capture-marks advance in the child (after the write), so a
   child that dies just re-picks the tail next Stop — no optimistic-mark loss.
-- **The Stop hook's cost is invisible to the user but real.** Anything added to
-  the capture path (the `recall-usefulness` transcript parse, etc.) runs in the
-  detached child, off the hot path — keep it there. The full-transcript parse
-  is ~0.36s even on a 66 MB transcript, so it is fine in the child, NOT inline.
+- **The Stop hook's cost is invisible to the user but real.** The slow work —
+  extraction, a serialized Ollama call — MUST run in the detached child, never
+  inline. The parent runs one bounded gate before spawning: a `_transcript_tail`
+  parse (tens of ms typically; ~0.36s worst-case on a 66 MB transcript) plus a
+  cheap debounce read, so a turn-end with no new content costs a parse instead
+  of a wasted child spawn (per-Stop subprocess churn is worse than the parse for
+  the common case). Keep the gate cheap and bounded; anything model-touching or
+  unbounded (the `recall-usefulness` full parse, etc.) stays in the child.
 
 ## Working rules for this repo
 

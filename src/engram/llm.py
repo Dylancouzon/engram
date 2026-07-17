@@ -44,7 +44,12 @@ class LocalLLM:
                 with urllib.request.urlopen(self._url + "/api/tags", timeout=2.0) as resp:
                     tags = json.loads(resp.read())
                 names = [m.get("name", "") for m in tags.get("models", [])]
-                self._available = any(n.startswith(self._model.split(":")[0]) for n in names)
+                # Match the exact tag, not the family: with split models a pulled
+                # qwen3:4b must NOT make qwen3:1.7b look available (else the
+                # capture gate passes and extraction 404s into verbatim tails).
+                # A tagless config (`qwen3`) still matches any qwen3:* tag.
+                want = self._model
+                self._available = any(n == want or n.startswith(want + ":") for n in names)
             except (urllib.error.URLError, TimeoutError, OSError, ValueError):
                 self._available = False
             self._probed_at = now
