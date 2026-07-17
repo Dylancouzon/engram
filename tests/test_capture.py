@@ -209,6 +209,45 @@ def test_spawn_background_capture_detaches_and_pipes_payload(monkeypatch):
     assert json.loads(seen["proc"].stdin.data) == payload
 
 
+def test_capture_parent_gates_before_spawning(tmp_path, monkeypatch):
+    # Regression: the parent must NOT spawn a child on a turn-end with no new
+    # content — that per-Stop Python spawn was the process churn. Only spawn
+    # when there is actually something to extract.
+    from click.testing import CliRunner
+
+    from engram import cli
+
+    calls = []
+    monkeypatch.setattr(cli, "_spawn_background_capture",
+                        lambda *a, **k: calls.append(a))
+    runner = CliRunner()
+
+    substantial = tmp_path / "big.jsonl"
+    substantial.write_text(json.dumps(
+        {"message": {"role": "user", "content": "x" * 200}, "promptSource": "typed"}))
+    r = runner.invoke(cli.main, ["--data-dir", str(tmp_path), "hook", "capture"],
+                      input=json.dumps({"transcript_path": str(substantial)}))
+    assert r.exit_code == 0 and len(calls) == 1  # new content -> spawn
+
+    calls.clear()
+    nothing_new = tmp_path / "tiny.jsonl"
+    nothing_new.write_text(json.dumps({"message": {"role": "assistant", "content": "hi"}}))
+    r = runner.invoke(cli.main, ["--data-dir", str(tmp_path), "hook", "capture"],
+                      input=json.dumps({"transcript_path": str(nothing_new)}))
+    assert r.exit_code == 0 and calls == []  # nothing new -> no spawn, no churn
+
+
+def test_capture_debounce(tmp_path):
+    # First capture of a conversation is allowed and stamps the time; an
+    # immediate repeat is debounced so rapid turns batch into one extraction.
+    from engram import cli
+
+    dd = str(tmp_path)
+    assert cli._capture_debounced(dd, "/x/sess.jsonl") is False   # first: allowed
+    assert cli._capture_debounced(dd, "/x/sess.jsonl") is True    # right after: skip
+    assert cli._capture_debounced(dd, "/x/other.jsonl") is False  # other convo independent
+
+
 if __name__ == "__main__":
     import sys
 

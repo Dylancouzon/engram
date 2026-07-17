@@ -952,6 +952,39 @@ def _recall_usefulness(transcript_path: str) -> dict | None:
     }
 
 
+_DEBOUNCE_FILE = "capture-debounce.json"
+
+
+def _capture_debounced(data_dir: str | None, transcript_path: str) -> bool:
+    """True if this conversation was captured within `capture_debounce_s` — the
+    caller should skip, so rapid turn-ends batch into one extraction instead of
+    a 10-40s model run each. The tail keeps accumulating (marks only advance on
+    a real capture), so nothing is lost. Records `now` when it lets a capture
+    through, so a slow capture can't be re-spawned on its heels."""
+    window = _config(data_dir).capture_debounce_s
+    if window <= 0:
+        return False
+    path = _config(data_dir).data_dir / _DEBOUNCE_FILE
+    try:
+        stamps = json.loads(path.read_text())
+    except (OSError, ValueError):
+        stamps = {}
+    now = dt.datetime.now().timestamp()
+    if now - stamps.get(transcript_path, 0) < window:
+        return True
+    stamps[transcript_path] = now
+    if len(stamps) > _MAX_TRACKED_TRANSCRIPTS:  # bound the file like capture-marks
+        stamps = dict(sorted(stamps.items(), key=lambda kv: kv[1])[-_MAX_TRACKED_TRANSCRIPTS:])
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(stamps))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # can't persist -> worst case we don't debounce; never block capture
+    return False
+
+
 _DEGRADE_WARN_FILE = "capture-degraded.warn"
 _DEGRADE_WARN_WINDOW = 6 * 3600  # Stop fires per conversation; re-warn at most every 6h
 
@@ -1007,15 +1040,32 @@ def hook_capture(data_dir: str | None, scope: str | None, max_chars: int) -> Non
     transcript through the full write pipeline; extraction's salience gate +
     dedup keep it clean. No-ops without a local extraction model."""
     payload = _hook_payload()
-    if os.environ.get("ENGRAM_CAPTURE_BG") != "1":
-        _spawn_background_capture(data_dir, payload, scope, max_chars)
+    if os.environ.get("ENGRAM_CAPTURE_BG") == "1":
+        _run_capture(data_dir, payload, scope, max_chars)
         return
-    _run_capture(data_dir, payload, scope, max_chars)
+    # Cheap gate in the PARENT before spawning: a turn-end with no new content
+    # (most Stops) must cost nothing — spawning a Python child just to no-op is
+    # what made engram churn a new PID on every turn. Only the slow part
+    # (extraction, a serialized model call) is worth detaching, and only when
+    # there is actually something to extract.
+    transcript_path = payload.get("transcript_path")
+    if not transcript_path or not Path(transcript_path).exists():
+        return
+    marks = _load_marks(data_dir)
+    tail, _ = _transcript_tail(transcript_path, max_chars,
+                               marks.get(transcript_path, 0))
+    if len(tail) < 40:
+        return  # nothing new since last capture — no child, no churn
+    if _capture_debounced(data_dir, transcript_path):
+        return  # captured this conversation recently; let the tail accumulate
+    _spawn_background_capture(data_dir, payload, scope, max_chars)
 
 
 def _run_capture(data_dir: str | None, payload: dict, scope: str | None,
                  max_chars: int) -> None:
-    """The actual harvest, run detached in the background child."""
+    """The actual harvest, run detached in the background child. Re-derives the
+    tail (the parent only gated on it) so the mark advances against exactly what
+    was extracted."""
     transcript_path = payload.get("transcript_path")
     if not transcript_path or not Path(transcript_path).exists():
         return

@@ -63,6 +63,11 @@ class Config:
     # Extraction (enhancer — verbatim fallback if unreachable)
     ollama_url: str = "http://localhost:11434"
     extraction_model: str = "qwen3:4b"
+    # Min seconds between captures of the SAME conversation. Each capture is a
+    # 10-40s local-model burst; without this, every turn-end fires one. Rapid
+    # turns batch — the transcript tail accumulates and is captured once per
+    # window (nothing lost). Tune in config.toml; 0 disables.
+    capture_debounce_s: float = 90.0
 
     # Redaction
     redaction_enabled: bool = True
