@@ -95,6 +95,13 @@ def judge(new_fact: str, candidates: list[Memory], llm: LocalLLM | None) -> Verd
     # bool is an int subclass: {"target": true} must not select index 1.
     if isinstance(idx, int) and not isinstance(idx, bool) and 0 <= idx < len(candidates):
         target = candidates[idx]
+    if op is Op.NOOP and target is None and len(candidates) == 1:
+        # The model reliably classifies NOOP right but omits the target, since a
+        # duplicate needs no "which one". With a single candidate the target is
+        # unambiguous, so keep the correct verdict instead of degrading a
+        # recognised duplicate into a fresh ADD. Multi-candidate stays ambiguous
+        # and falls through to the ADD guard below.
+        target = candidates[0]
     if op is not Op.ADD and target is None:
         # An op that needs a target but names none is not actionable.
         return Verdict(op=Op.ADD, target=None, confidence=0.0)

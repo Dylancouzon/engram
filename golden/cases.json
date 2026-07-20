@@ -226,6 +226,169 @@
       "expect_op": "ADD",
       "recall_query": "what does Dylan use for Python packaging",
       "expect_recalled": "uv"
+    },
+
+    {
+      "name": "easy-add-01",
+      "existing": ["Dylan's cat is named Miso"],
+      "input": "The Qdrant Cloud console shows cluster CPU usage as a percentage",
+      "expect_op": "ADD"
+    },
+    {
+      "name": "easy-add-02",
+      "existing": ["Dylan lives in Berlin"],
+      "input": "FastEmbed lazy-loads the nomic model on first embed call",
+      "expect_op": "ADD"
+    },
+    {
+      "name": "easy-add-03",
+      "existing": ["The launch is planned for March 17th"],
+      "input": "Dylan prefers oat milk in his coffee",
+      "expect_op": "ADD"
+    },
+    {
+      "name": "easy-add-04",
+      "existing": ["Sarah handles the newsletter"],
+      "input": "The demo runs on a Jetson Orin Nano",
+      "expect_op": "ADD"
+    },
+    {
+      "name": "easy-add-05",
+      "existing": ["Maria is pescatarian"],
+      "input": "The staging cluster runs Qdrant 1.15",
+      "expect_op": "ADD"
+    },
+    {
+      "name": "easy-add-06",
+      "existing": ["Dylan's manager is called André Zayarni"],
+      "input": "miniCOIL is Qdrant's sparse embedding model based on IDF",
+      "expect_op": "ADD"
+    },
+    {
+      "name": "easy-add-07",
+      "existing": ["The team decided to use SQLite for the metadata store"],
+      "input": "Dylan's second cat is named Tofu",
+      "expect_op": "ADD"
+    },
+    {
+      "name": "easy-add-08",
+      "existing": ["Dylan runs three times a week"],
+      "input": "The project is pinned to Python 3.12",
+      "expect_op": "ADD"
+    },
+
+    {
+      "name": "paraphrase-noop-01",
+      "existing": ["Dylan is allergic to peanuts"],
+      "input": "Peanuts give Dylan an allergic reaction",
+      "expect_op": "NOOP"
+    },
+    {
+      "name": "paraphrase-noop-02",
+      "existing": ["The launch is planned for March 17th"],
+      "input": "March 17th is when the launch is scheduled",
+      "expect_op": "NOOP"
+    },
+    {
+      "name": "paraphrase-noop-03",
+      "existing": ["Dylan's cat is named Miso"],
+      "input": "Miso is the name of Dylan's cat",
+      "expect_op": "NOOP"
+    },
+    {
+      "name": "paraphrase-noop-04",
+      "existing": ["The team decided to use SQLite for the metadata store"],
+      "input": "We're going with SQLite for metadata storage",
+      "expect_op": "NOOP"
+    },
+    {
+      "name": "paraphrase-noop-05",
+      "existing": ["Dylan prefers uv over pip for Python projects"],
+      "input": "For Python, Dylan likes uv better than pip",
+      "expect_op": "NOOP"
+    },
+    {
+      "name": "paraphrase-noop-06",
+      "existing": ["Sarah handles the newsletter"],
+      "input": "The newsletter is managed by Sarah",
+      "expect_op": "NOOP"
+    },
+    {
+      "name": "paraphrase-noop-07",
+      "existing": ["The staging cluster runs Qdrant 1.15"],
+      "input": "Qdrant 1.15 is what's running on staging",
+      "expect_op": "NOOP"
+    },
+    {
+      "name": "paraphrase-noop-08",
+      "existing": ["Dylan lives in Berlin"],
+      "input": "Dylan is based in Berlin",
+      "expect_op": "NOOP"
+    },
+
+    {
+      "name": "adversarial-near-miss-01",
+      "existing": ["Dylan lives in Paris"],
+      "input": "Dylan used to live in Paris, before he moved to Berlin",
+      "expect_op": "SUPERSEDE",
+      "recall_query": "where does Dylan live",
+      "expect_recalled": "Berlin"
+    },
+    {
+      "name": "adversarial-near-miss-02",
+      "existing": ["Maria is vegetarian"],
+      "input": "Maria is not vegetarian anymore, she eats meat now",
+      "expect_op": "SUPERSEDE",
+      "recall_query": "does Maria eat meat",
+      "expect_recalled": "meat"
+    },
+    {
+      "name": "adversarial-near-miss-03",
+      "existing": ["The launch is planned for March 17th"],
+      "input": "The launch is NOT happening on March 17th anymore, it's delayed indefinitely",
+      "expect_op": "SUPERSEDE",
+      "recall_query": "when is the launch",
+      "expect_recalled": "delayed"
+    },
+    {
+      "name": "adversarial-near-miss-04",
+      "existing": ["Dylan prefers VS Code as his main editor"],
+      "input": "Dylan does not use VS Code anymore, he moved to Zed",
+      "expect_op": ["SUPERSEDE", "UPDATE"],
+      "recall_query": "which editor does Dylan use",
+      "expect_recalled": "Zed"
+    },
+    {
+      "name": "adversarial-near-miss-05",
+      "existing": ["Dylan's cat Miso is a grey British Shorthair"],
+      "input": "Miso isn't grey anymore, he's mostly white now that he's older",
+      "expect_op": ["UPDATE", "SUPERSEDE"],
+      "recall_query": "what color is Dylan's cat",
+      "expect_recalled": "white"
+    },
+    {
+      "name": "adversarial-near-miss-06",
+      "existing": ["Staging runs Qdrant 1.15"],
+      "input": "Staging used to run Qdrant 1.15 but was rolled back to 1.14",
+      "expect_op": "SUPERSEDE",
+      "recall_query": "which Qdrant version runs on staging",
+      "expect_recalled": "1.14"
+    },
+    {
+      "name": "adversarial-near-miss-07",
+      "existing": ["Dylan takes oat milk in his coffee"],
+      "input": "Dylan takes oat milk in his tea, not his coffee",
+      "expect_op": "ADD",
+      "recall_query": "how does Dylan take his tea",
+      "expect_recalled": "oat milk"
+    },
+    {
+      "name": "adversarial-near-miss-08",
+      "existing": ["The team decided to use Postgres for the metadata store"],
+      "input": "We decided to use Postgres for the analytics store too, a separate database",
+      "expect_op": "ADD",
+      "recall_query": "what database is used for analytics",
+      "expect_recalled": "Postgres"
     }
   ]
 }

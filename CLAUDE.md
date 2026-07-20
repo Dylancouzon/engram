@@ -219,6 +219,48 @@ the extraction-time `general`/project scope call, so more project facts
 misroute to `default` (undermining the §1.3 confidence gate) — the report's
 scope-health signal is how to catch them.
 
+A classification-alternatives evaluation (five parallel research passes —
+GLiNER2, SetFit/embedding heads, constrained decoding + LoRA, embedding-only
+heuristics, small encoder cross-encoders — followed by real experiments
+against the live store and an expanded golden set) closed with a different
+result than any of the five candidates: a real bug, not a model swap.
+**Findings:** an embedding-only scope classifier (nearest-centroid and a
+class-balanced logistic-regression head, both on the existing nomic-embed
+vectors) lost badly to the current qwen3:1.7b baseline on the live store's
+225 hand-labeled memories (13%/20% and 0%/0% general-class precision/recall
+vs. the LLM's 32%/60%) — only 15 of 225 are scope `default`, too little data
+in 768 dimensions, and "project" is 12 different sub-topics, not one
+cluster; don't revisit without materially more `default`-scoped labels.
+Extraction's JSON-envelope reliability was re-measured (77 inputs incl. 20
+adversarial) at 0 parse failures against the current model — the multi-shape
+parser in `extract.py` stays untouched, nothing to fix. Relevance-formula
+tuning is blocked: `activity.jsonl` never logged candidate-level data
+(ids/raw scores/rejected candidates) to replay offline, and the
+`recall-usefulness` proxy (`cli.py::_recall_usefulness`) shows a flat 0
+used / 1074 judged across the store's whole history — undetermined whether
+that's the proxy's documented weakness or a real bug; needs a manual trace
+against one real transcript before Experiment 4 is revisited.
+**The actual fix:** growing the golden set (29 -> 53 cases, adding easy-ADD/
+paraphrase-NOOP/adversarial-near-miss cases) surfaced that the judge model
+(qwen3:4b) reliably returns a correct, confident NOOP verdict but omits
+`target` (it doesn't think "this is a duplicate" needs to name which memory)
+— and `resolve.py`'s `judge()` blanket-degraded any targetless non-ADD op to
+ADD, silently turning recognized duplicates into fresh ADDs. Fixed: NOOP
+with no target defaults to the sole candidate when there is exactly one
+(unambiguous); the multi-candidate case still degrades to ADD (genuinely
+ambiguous which memory NOOP'd); UPDATE/SUPERSEDE untouched (still require an
+explicit target — a wrongful merge/supersede is the unrecoverable
+direction, unlike a missed NOOP). Op accuracy on the 53-case golden set:
+68% -> 85% (measured before the fix, after the golden-set expansion exposed
+it) from this one change alone — bigger than anything the five researched
+alternatives would have delivered. `golden/cases.json` now has 53 cases;
+`golden/scope_eval.py` is the throwaway embedding-classifier probe (kept for
+reference, not part of CI). Two remaining golden-set failures are a genuine,
+minor judge weakness on hard adversarial near-misses (surface lexical
+overlap across different attributes, e.g. "oat milk in his tea, not his
+coffee" merges as UPDATE instead of ADD) — documented, not investigated
+further; the confidence gate already bounds the damage.
+
 Not built (deliberate cuts, not omissions): Wave-C/D ingestion adapters
 (email/messages/voice/CLIP) — the adapter *contract* is documented in
 `docs/ingestion.md` and the write path is proven, so these are per-source

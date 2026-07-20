@@ -145,3 +145,24 @@ def test_judge_bool_target_is_not_an_index():
     ]
     verdict = judge("new fact", candidates, _BoolTargetLLM())
     assert verdict.op is Op.ADD and verdict.target is None
+
+
+def test_noop_without_target_defaults_to_sole_candidate():
+    # qwen3 reliably returns NOOP with target=null; a single candidate makes
+    # the target unambiguous, so the duplicate must not degrade into an ADD.
+    only = Memory(id="6f1a4b1e-0000-4000-8000-000000000001", text="a")
+    llm = FakeLLM(judge_responses=[{"op": "NOOP", "target": None, "confidence": 1.0}])
+    verdict = judge("a restated", [only], llm)
+    assert verdict.op is Op.NOOP and verdict.target is only
+
+
+def test_noop_without_target_stays_add_when_ambiguous():
+    # Multiple candidates and no named target: which duplicate is genuinely
+    # ambiguous, so fail toward ADD rather than guess.
+    candidates = [
+        Memory(id="6f1a4b1e-0000-4000-8000-000000000001", text="a"),
+        Memory(id="6f1a4b1e-0000-4000-8000-000000000002", text="b"),
+    ]
+    llm = FakeLLM(judge_responses=[{"op": "NOOP", "target": None, "confidence": 1.0}])
+    verdict = judge("new fact", candidates, llm)
+    assert verdict.op is Op.ADD and verdict.target is None
