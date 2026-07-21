@@ -229,6 +229,51 @@
     },
 
     {
+      "name": "junk-intent-statement",
+      "existing": [],
+      "input": "I will fix the typo in the code file.",
+      "expect_op": "(salience-dropped)"
+    },
+    {
+      "name": "junk-intent-readme",
+      "existing": [],
+      "input": "I will update the README file with the new version number.",
+      "expect_op": "(salience-dropped)"
+    },
+    {
+      "name": "junk-bare-question",
+      "existing": [],
+      "input": "Should check_gate be dropped?",
+      "expect_op": "(salience-dropped)"
+    },
+    {
+      "name": "junk-heading-fragment",
+      "existing": [],
+      "input": "Key Considerations for Static Embeddings",
+      "expect_op": "(salience-dropped)"
+    },
+    {
+      "name": "junk-bare-ack",
+      "existing": [],
+      "input": "Go with the recommendations.",
+      "expect_op": "(salience-dropped)"
+    },
+    {
+      "name": "junk-chat-line-fragment",
+      "existing": [],
+      "input": "Luis Cossío [3:39 PM] ah, edge",
+      "expect_op": "(salience-dropped)"
+    },
+    {
+      "name": "guard-chat-thread-durable-fact",
+      "existing": [],
+      "input": "Andrey Vasnetsov [3:36 PM] There's not much information on whether Edge supports concurrent writes or the minimum hardware requirements.\nLuis Cossío [3:39 PM] I thought we had async methods there?\nAndrey Vasnetsov [3:39 PM] on edge? nope",
+      "expect_op": "ADD",
+      "recall_query": "does Qdrant Edge have async methods",
+      "expect_recalled": "async"
+    },
+
+    {
       "name": "easy-add-01",
       "existing": ["Dylan's cat is named Miso"],
       "input": "The Qdrant Cloud console shows cluster CPU usage as a percentage",

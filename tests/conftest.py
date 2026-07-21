@@ -52,9 +52,11 @@ class FakeLLM:
     judge calls; extraction returns verbatim unless `extract_response` set."""
 
     def __init__(self, judge_responses: list[dict] | None = None,
-                 extract_response: dict | None = None):
+                 extract_response: dict | None = None,
+                 general_response: dict | None = None):
         self.judge_responses = list(judge_responses or [])
         self.extract_response = extract_response
+        self.general_response = general_response or {"general": True}
         self.judge_prompts: list[str] = []
 
     def available(self) -> bool:
@@ -63,6 +65,8 @@ class FakeLLM:
     def generate_json(self, system: str, prompt: str):
         if "You extract long-term memories" in system:
             return self.extract_response  # None -> verbatim fallback
+        if "about the user themselves" in system:
+            return self.general_response
         self.judge_prompts.append(prompt)
         if self.judge_responses:
             return self.judge_responses.pop(0)

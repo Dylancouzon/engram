@@ -56,6 +56,23 @@ def test_low_confidence_general_stays_in_project_scope(config):
         store.close()
 
 
+def test_judge_veto_keeps_general_fact_in_project_scope(config):
+    # The extraction model over-claims `general`; the judge model re-checks
+    # the escape. Judge says project fact -> stays project-scoped even at
+    # high extraction confidence.
+    llm = FakeLLM(extract_response={"memories": [
+        {"text": "Review the full workshop plan in CLAUDE.md", "general": True,
+         "general_confidence": 0.95},
+    ]}, general_response={"general": False})
+    store = make_store(config, llm=llm)
+    try:
+        [action] = store.remember("Review the full workshop plan in CLAUDE.md",
+                                  scope="project:rag-workshop")
+        assert action.memory.scope == "project:rag-workshop"
+    finally:
+        store.close()
+
+
 def test_general_flag_ignored_outside_project_scope(config):
     # The flag only demotes an inferred project scope; an explicit
     # non-project scope is the caller's own choice.

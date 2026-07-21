@@ -420,7 +420,8 @@ class MemoryStore:
                 # project scope only when the model is sure.
                 generalize = (fact.general
                               and fact.general_confidence >= self.config.judge_confidence
-                              and scope.startswith("project:"))
+                              and scope.startswith("project:")
+                              and self._confirm_general(fact.text))
                 fact_scope = "default" if generalize else scope
                 verdict = self._resolve_conflict(fact, fact_scope, shard)
                 action = self._apply(fact, verdict, source_text, fact_scope, surface,
@@ -428,6 +429,24 @@ class MemoryStore:
                 action.redaction_hits = scrubbed.hits
                 actions.append(action)
             return actions
+
+    _GENERAL_SYSTEM = (
+        "Decide if a fact is about the user themselves — a preference, habit,"
+        " or way of working that would hold in any project — or about a"
+        " specific project's code, content, infra, or decisions.\n"
+        'Respond with JSON: {"general": true or false}. When unsure, false.'
+    )
+
+    def _confirm_general(self, text: str) -> bool:
+        """The extraction model over-claims `general` (measured in the July
+        2026 dogfood: project facts escaping to `default` were 64% of all hook
+        injections). The judge model re-checks the rare escape with a short
+        prompt — its strength. No judge reachable -> trust extraction."""
+        llm = self.judge_llm
+        if llm is None or not llm.available():
+            return True
+        result = llm.generate_json(self._GENERAL_SYSTEM, text)
+        return isinstance(result, dict) and result.get("general") is True
 
     def _resolve_conflict(self, fact: ExtractedFact, scope: str, shard: str) -> Verdict:
         # Candidates come from a dense-only search within the target shard:

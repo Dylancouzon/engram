@@ -34,6 +34,12 @@ _TRANSIENT = re.compile(
 )
 _TRANSIENT_MAX_IMPORTANCE = 0.4  # keep transient notes out of the sticky high band
 
+# A chat-timestamp marker ("Luis [3:39 PM]", "[15:04]") inside an extracted
+# fact means the model quoted a transcript line instead of stating a fact —
+# the dogfood store collected dozens of these. Only model output is filtered;
+# the no-model verbatim path stores the user's text untouched.
+_CHAT_LINE = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?\]", re.IGNORECASE)
+
 
 def _content_tokens(text: str) -> set[str]:
     # Drop redaction placeholders first: their generic words ("redacted",
@@ -52,6 +58,14 @@ Rules:
 - If the message is only a question or a request to do something, with no
   durable fact stated, return {"memories": []}. If it also states a durable
   fact, extract just that fact.
+- A statement of intent ("I will update the README") is a transient plan,
+  not a fact — skip it, but still extract any durable fact stated alongside.
+  A decision that sets standing state ("we chose SQLite") is worth keeping.
+- A bare title or heading with no claim ("Key Considerations for X") states
+  nothing — skip it, and never expand it into facts it does not state.
+- A pasted chat or log transcript: never copy lines verbatim. Extract only
+  durable facts stated in it, rephrased self-contained with the speaker
+  named ("Andrey said Edge has no async methods").
 - type: "semantic" for facts/preferences/decisions, "episodic" for dated
   events ("X happened on/when ..."), "procedural" for how-tos and workflows.
 - importance: calibrate, do not inflate. MOST facts are 0.3-0.5. Use 0.6-0.7
@@ -111,6 +125,7 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
     raw = items if isinstance(items, list) else []
     facts: list[ExtractedFact] = []
     had_usable = False  # at least one item the model gave usable text for
+    chat_quoted = False  # model quoted transcript lines instead of extracting
     for item in raw:
         if not isinstance(item, dict) or not item.get("text"):
             continue
@@ -127,6 +142,9 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
             continue
         tags = [str(t).lower() for t in (item.get("tags") or []) if t][:3]
         fact_text = str(item["text"]).strip()
+        if _CHAT_LINE.search(fact_text):
+            chat_quoted = True
+            continue  # quoted transcript line, not an extracted fact
         # A transient/breakage note is never a durable semantic or procedural
         # fact, whatever the model guessed — demote so it decays and can't
         # outlive the fix.
@@ -146,6 +164,10 @@ def extract(text: str, llm: LocalLLM | None, salience_floor: float = 0.1) -> lis
         facts[0].importance = min(facts[0].importance, _TRANSIENT_MAX_IMPORTANCE)
 
     if not facts:
+        # A chat paste the model only quoted from was never really extracted —
+        # keep it whole as one verbatim memory rather than lose its content.
+        if chat_quoted:
+            return [ExtractedFact(text=text.strip(), verbatim=True)]
         # Honor a real "nothing salient" judgment (the model gave usable items
         # and they all fell below the floor, or it returned an empty list) as
         # []. Only fall back to verbatim when NO usable item came back — a

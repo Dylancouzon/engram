@@ -17,10 +17,10 @@ health report before deciding what to improve.
 ## Status: M0–M3 complete
 
 All four milestones built, reviewed (Codex + andrey-review adversarial passes,
-all findings fixed), and validated with real models. **177 tests green**, ruff
-clean. Golden set: **84% op accuracy, 100% recall accuracy** (misses are the
-safe direction: mostly degrade-to-ADD, plus a couple NOOP→UPDATE — never a
-wrongful supersede or a lost recall). ~4500 LOC source.
+all findings fixed), and validated with real models. **186 tests green**, ruff
+clean. Golden set: **60 cases, 85% op accuracy, 98% recall accuracy** (misses
+are the safe direction: mostly degrade-to-ADD, plus a couple NOOP→UPDATE —
+never a wrongful supersede or a lost recall). ~4500 LOC source.
 
 A reliability/dogfood pass hardened four things (all reviewed, tests added):
 reads no longer grow the source of truth (`journal.reinforce` collapses to
@@ -261,7 +261,32 @@ overlap across different attributes, e.g. "oat milk in his tea, not his
 coffee" merges as UPDATE instead of ADD) — documented, not investigated
 further; the confidence gate already bounds the damage.
 
-Not built (deliberate cuts, not omissions): Wave-C/D ingestion adapters
+A dogfood junk/scope pass (July 21, driven by the 8.9-day activity report)
+attacked the two dominant signals: 5 memories ate 64% of all hook injections
+(entrenchment) at a 3% usefulness echo, and the newest captures were visibly
+junk. Root causes: (1) the extraction model stored transient intents ("I will
+fix the typo"), bare questions, document headings, and individual Slack chat
+lines as durable facts; (2) project facts escaped to scope `default` past the
+extraction-side confidence gate (qwen3:1.7b over-claims `general`), so they
+were injected into every project's sessions and crowded the 4-slot cap —
+confirmed live: a recall in the engram repo injected three wrong-project
+`default` facts while on-topic candidates were rejected. Fixes (**186
+tests**): extraction prompt now rejects intent statements, headings, and
+verbatim chat lines (7 new golden cases, `junk-*`/`guard-chat-*`); a
+deterministic filter drops any extracted fact still carrying a chat
+timestamp ("Luis [3:39 PM]"), and if the model ONLY quoted lines the paste is
+kept whole as one verbatim memory (fail toward keeping data);
+`store._confirm_general` re-checks every `general=true` escape with the
+judge model (4b, short prompt = its strength) before a fact lands in
+`default` — no judge reachable degrades to the old extraction-only gate.
+Known miss, documented in the golden set: a SINGLE pasted chat line with no
+content ("ah, edge") still becomes a small grounded fact ("Luis said Edge");
+no deterministic catch exists that wouldn't also kill legitimate "X said Y"
+facts. Live store cleaned the same day: 7 mis-scoped `default` facts moved to
+their real project scopes via daemon `edit` (the entrenched workshop-plan and
+learnings.md memories among them); ~28 junk memories identified for
+soft-forget (list in the session report — bulk forget needed Dylan's
+approval and was deferred). Wave-C/D ingestion adapters
 (email/messages/voice/CLIP) — the adapter *contract* is documented in
 `docs/ingestion.md` and the write path is proven, so these are per-source
 adapters, not new architecture. Also skipped: streaming export, a systemd

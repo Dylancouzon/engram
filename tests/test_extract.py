@@ -216,3 +216,26 @@ def test_transient_mention_does_not_demote_multi_fact_split():
     facts = extract("the build is currently broken. also Dylan prefers concise READMEs", llm)
     durable = [f for f in facts if "READMEs" in f.text][0]
     assert durable.type is MemoryType.SEMANTIC and durable.importance == 0.7
+
+
+def test_chat_quoted_fact_is_dropped():
+    # A fact still carrying a chat timestamp is a quoted transcript line,
+    # not an extraction — drop it, keep the real fact beside it.
+    llm = EnvelopeLLM({"memories": [
+        {"text": "Luis Cossío [3:39 PM] I thought we had async methods there?",
+         "importance": 0.5},
+        {"text": "Edge has no async methods", "importance": 0.6}]})
+    [fact] = extract("Luis Cossío [3:39 PM] I thought we had async methods "
+                     "there?\nAndrey [3:40 PM] on edge? nope", llm)
+    assert fact.text == "Edge has no async methods" and not fact.verbatim
+
+
+def test_all_chat_quoted_falls_back_to_verbatim():
+    # If the model only quoted lines, the paste was never extracted — keep it
+    # whole as one verbatim memory rather than lose its content.
+    src = "Andrey [3:36 PM] no docs on concurrent writes for Edge"
+    llm = EnvelopeLLM({"memories": [
+        {"text": "Andrey [3:36 PM] no docs on concurrent writes for Edge",
+         "importance": 0.5}]})
+    [fact] = extract(src, llm)
+    assert fact.verbatim and fact.text == src
